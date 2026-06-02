@@ -38,6 +38,13 @@ struct MetalContext::Impl {
     // Reusable cross-product buffer — avoids 4MB+ alloc per search call.
     std::vector<float> cross_buf;
     int64_t            cross_buf_Q = 0, cross_buf_N = 0;
+
+    // MPS Metal buffer cache for brute-force GPU search.
+    id<MTLBuffer>   buf_dataset_metal = nil;
+    const float*    buf_dataset_ptr   = nullptr;
+    int64_t         buf_dataset_N     = 0, buf_dataset_D = 0;
+    id<MTLBuffer>   buf_cross_metal   = nil;
+    int64_t         buf_cross_Q       = 0, buf_cross_N   = 0;
 };
 
 // ── Constructor ───────────────────────────────────────────────────────────
@@ -129,21 +136,61 @@ uint64_t MetalContext::search_brute_force(
 
     {
 
-        // ── Accelerate BLAS: cross[Q×N] = queries[Q×D] @ dataset[N×D]^T ──
-        // Uses Apple AMX hardware via Accelerate framework — same path as MLX.
-        // cblas_sgemm: C = alpha*A*B^T + beta*C
-        //   A = queries  (Q×D, lda=D)
-        //   B = dataset  (N×D, ldb=D, transposed)
-        //   C = cross    (Q×N, ldc=N)
-        if (impl_->cross_buf_Q != Q || impl_->cross_buf_N != N)
-            impl_->cross_buf.resize(static_cast<size_t>(Q * N));
-        impl_->cross_buf_Q = Q;
-        impl_->cross_buf_N = N;
+        // ── MPS Metal GPU: cross[Q×N] = queries[Q×D] @ dataset[N×D]^T ──
+        // Replaces AMX cblas_sgemm for large N where Metal GPU bandwidth wins.
+        // Dataset and cross buffers are cached to amortize allocation costs.
+        @autoreleasepool {
+            if (impl_->buf_dataset_ptr != dataset ||
+                impl_->buf_dataset_N != N || impl_->buf_dataset_D != D) {
+                impl_->buf_dataset_metal = make_shared_buf(impl_->device, dataset,
+                    (NSUInteger)(N * D * sizeof(float)));
+                impl_->buf_dataset_ptr = dataset;
+                impl_->buf_dataset_N   = N;
+                impl_->buf_dataset_D   = D;
+            }
+            if (impl_->buf_cross_Q != Q || impl_->buf_cross_N != N) {
+                impl_->buf_cross_metal = [impl_->device
+                    newBufferWithLength:(NSUInteger)(Q * N * sizeof(float))
+                    options:MTLResourceStorageModeShared];
+                impl_->buf_cross_Q = Q;
+                impl_->buf_cross_N = N;
+            }
 
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    (int)Q, (int)N, (int)D,
-                    1.0f, queries, (int)D, dataset, (int)D,
-                    0.0f, impl_->cross_buf.data(), (int)N);
+            auto buf_q = make_shared_buf(impl_->device, queries,
+                             (NSUInteger)(Q * D * sizeof(float)));
+
+            MPSMatrixDescriptor* dQ = [MPSMatrixDescriptor
+                matrixDescriptorWithRows:(NSUInteger)Q columns:(NSUInteger)D
+                rowBytes:(NSUInteger)(D*sizeof(float)) dataType:MPSDataTypeFloat32];
+            MPSMatrixDescriptor* dD = [MPSMatrixDescriptor
+                matrixDescriptorWithRows:(NSUInteger)N columns:(NSUInteger)D
+                rowBytes:(NSUInteger)(D*sizeof(float)) dataType:MPSDataTypeFloat32];
+            MPSMatrixDescriptor* dC = [MPSMatrixDescriptor
+                matrixDescriptorWithRows:(NSUInteger)Q columns:(NSUInteger)N
+                rowBytes:(NSUInteger)(N*sizeof(float)) dataType:MPSDataTypeFloat32];
+
+            MPSMatrix* matQ = [[MPSMatrix alloc] initWithBuffer:buf_q         descriptor:dQ];
+            MPSMatrix* matD = [[MPSMatrix alloc] initWithBuffer:impl_->buf_dataset_metal descriptor:dD];
+            MPSMatrix* matC = [[MPSMatrix alloc] initWithBuffer:impl_->buf_cross_metal  descriptor:dC];
+
+            MPSMatrixMultiplication* gemm = [[MPSMatrixMultiplication alloc]
+                initWithDevice:impl_->device transposeLeft:NO transposeRight:YES
+                resultRows:(NSUInteger)Q resultColumns:(NSUInteger)N
+                interiorColumns:(NSUInteger)D alpha:1.0 beta:0.0];
+
+            auto cmd = [impl_->queue commandBuffer];
+            [gemm encodeToCommandBuffer:cmd leftMatrix:matQ rightMatrix:matD resultMatrix:matC];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+
+        // cross_buf points into the cached shared MTL buffer
+        if (impl_->cross_buf_Q != Q || impl_->cross_buf_N != N) {
+            impl_->cross_buf.resize(static_cast<size_t>(Q * N));
+            impl_->cross_buf_Q = Q; impl_->cross_buf_N = N;
+        }
+        std::copy_n((const float*)impl_->buf_cross_metal.contents,
+                    static_cast<size_t>(Q * N), impl_->cross_buf.data());
 
         // ── L2 distances: dist[q,n] = q_norm - 2*cross + d_norm ──────────
         const auto q_norms = compute_row_norms(queries, Q, D);
