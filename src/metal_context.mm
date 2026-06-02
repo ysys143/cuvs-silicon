@@ -407,7 +407,7 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
             const int64_t nk = static_cast<int64_t>(own.size());
             if (M <= 1) continue;
 
-            // Gather probe vectors and own vectors
+            // Gather probe vectors (capped at MAX_PROBE)
             std::vector<float> probe_vecs(static_cast<size_t>(M * D));
             std::vector<float> probe_norms(static_cast<size_t>(M));
             for (int64_t m = 0; m < M; ++m) {
@@ -417,26 +417,36 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
                 probe_norms[static_cast<size_t>(m)] =
                     norms[static_cast<size_t>(probe[static_cast<size_t>(m)])];
             }
-            std::vector<float> own_vecs(static_cast<size_t>(nk * D));
-            for (int64_t i = 0; i < nk; ++i)
-                std::copy_n(dataset + own[static_cast<size_t>(i)]*D,
-                            static_cast<size_t>(D),
-                            own_vecs.data() + i*D);
 
-            // cross[nk×M] = own_vecs[nk×D] @ probe_vecs[M×D]^T
-            std::vector<float> cross_nm(static_cast<size_t>(nk * M));
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        (int)nk, (int)M, (int)D,
-                        1.0f, own_vecs.data(), (int)D,
-                        probe_vecs.data(), (int)D,
-                        0.0f, cross_nm.data(), (int)M);
-
-            // For each own vector: find top-G from probe set
+            // Process own cluster in batches to bound sgemm size.
+            // cross[batch×M] = own_batch[batch×D] @ probe_vecs[M×D]^T
+            // MAX_BATCH prevents OOM for degenerate large clusters.
+            constexpr int64_t MAX_BATCH = 4096;
+            std::vector<float> batch_vecs(static_cast<size_t>(
+                std::min(nk, MAX_BATCH) * D));
+            std::vector<float> cross_batch(static_cast<size_t>(
+                std::min(nk, MAX_BATCH) * M));
             std::vector<uint32_t> midx(static_cast<size_t>(M));
-            for (int64_t i = 0; i < nk; ++i) {
+
+            for (int64_t istart = 0; istart < nk; istart += MAX_BATCH) {
+                const int64_t iend  = std::min(istart + MAX_BATCH, nk);
+                const int64_t ibsz  = iend - istart;
+
+                for (int64_t ii = 0; ii < ibsz; ++ii)
+                    std::copy_n(dataset + own[static_cast<size_t>(istart+ii)]*D,
+                                static_cast<size_t>(D),
+                                batch_vecs.data() + ii*D);
+
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            (int)ibsz, (int)M, (int)D,
+                            1.0f, batch_vecs.data(), (int)D,
+                            probe_vecs.data(), (int)D,
+                            0.0f, cross_batch.data(), (int)M);
+
+            for (int64_t i = istart; i < iend; ++i) {
                 const uint32_t vi = own[static_cast<size_t>(i)];
                 const float ni    = norms[static_cast<size_t>(vi)];
-                const float* cr   = cross_nm.data() + i*M;
+                const float* cr   = cross_batch.data() + (i-istart)*M;
                 std::iota(midx.begin(), midx.end(), 0u);
                 const int64_t take = std::min((int64_t)G, M-1);
                 std::partial_sort(midx.begin(), midx.begin()+take, midx.end(),
@@ -455,6 +465,7 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
                     insert_neighbor(vi, nbr, d);
                 }
             }
+            } // end batch loop (istart)
         }
     } // end IVF seeding
 
