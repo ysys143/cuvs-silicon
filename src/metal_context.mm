@@ -406,6 +406,11 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
                 for (auto v : clusters[static_cast<size_t>(nc)])
                     probe.push_back(v);
 
+            // Cap probe to prevent sgemm blowup on unbalanced near clusters.
+            constexpr int64_t MAX_PROBE = 8192;
+            if (static_cast<int64_t>(probe.size()) > MAX_PROBE)
+                probe.resize(static_cast<size_t>(MAX_PROBE));
+
             const int64_t M = static_cast<int64_t>(probe.size());
             if (M <= 1) continue;
 

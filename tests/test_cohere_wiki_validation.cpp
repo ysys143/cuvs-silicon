@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -26,6 +27,12 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <unistd.h>
+
+static void build_timeout_handler(int) {
+    std::fprintf(stderr, "\n[TIMEOUT] Graph build exceeded time limit. Aborting.\n");
+    _exit(1);
+}
 
 #include <cuvs/neighbors/cagra.hpp>
 #include <raft/core/resources.hpp>
@@ -93,10 +100,13 @@ static BenchResult run_metal_bench(
     ip.graph_degree = 64;
 
     std::printf("  Building CAGRA graph (GPU)...\n");
+    std::signal(SIGALRM, build_timeout_handler);
+    alarm(120);  // abort if build takes > 120s
     const auto t_build0 = Clock::now();
     auto idx = cuvs::neighbors::cagra::build(
         res, ip,
         raft::device_matrix_view<const float, std::int64_t>(base, N, D));
+    alarm(0);
     const double build_ms =
         std::chrono::duration<double, std::milli>(Clock::now() - t_build0).count();
     std::printf("  Build time: %.2fs  graph_degree=%u  has_graph=%s\n",
