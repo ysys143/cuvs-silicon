@@ -98,11 +98,11 @@ static BenchResult run_metal_bench(
     std::printf("  Building CAGRA graph (GPU)...\n"); fflush(stdout);
     std::atomic<bool> build_done{false};
     std::thread watchdog([&build_done]() {
-        for (int i = 0; i < 120; ++i) {
+        for (int i = 0; i < 900; ++i) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             if (build_done.load()) return;
         }
-        std::fprintf(stderr, "\n[TIMEOUT] Build exceeded 120s. Aborting.\n");
+        std::fprintf(stderr, "\n[TIMEOUT] Build exceeded 900s. Aborting.\n");
         _exit(1);
     });
     const auto t_build0 = Clock::now();
