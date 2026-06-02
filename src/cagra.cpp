@@ -175,16 +175,22 @@ void search<float, std::uint32_t, std::int64_t>(
           }
         }
 
+        // Adaptive search params: small Q → smaller beam to reduce serial work
+        // and improve single-query latency (beam_size scales O(beam²) per iter).
+        uint32_t beam = static_cast<uint32_t>(
+            params.itopk_size > 0 ? params.itopk_size : 128);
+        uint32_t iters = static_cast<uint32_t>(
+            params.max_iterations > 0 ? params.max_iterations : 200);
+        if (query_count <= 4) {
+            beam  = std::min(beam,  32u);
+            iters = std::min(iters, 200u);
+        }
         dispatches = ctx.search_cagra(
             dataset.data(),           vector_count, dimension,
             index.knn_graph().data(), index.graph_degree(),
             queries.data_handle(),    query_count,
             neighbors.data_handle(),  distances.data_handle(),
-            k,
-            static_cast<std::uint32_t>(params.itopk_size > 0
-                ? params.itopk_size : 128),
-            static_cast<std::uint32_t>(params.max_iterations > 0
-                ? params.max_iterations : 200),
+            k, beam, iters,
             nav.empty() ? nullptr : entry_nodes.data());
       } else {
         dispatches = ctx.search_brute_force(
