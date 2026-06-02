@@ -266,6 +266,73 @@ kernel void nn_descent(
     if (any_improved) improved[node_id] = 1;
 }
 
+// Random bucketing: GPU-accelerated cross-cluster graph seeding.
+// One threadgroup per bucket. One thread per vector in the bucket.
+// Each thread computes float4 L2 distances to all Bs bucket vectors,
+// maintains a top-G max-heap in registers, then merges into the global graph.
+// Buckets are non-overlapping (rperm is a permutation) → no write conflicts.
+#define RBUCKET_MAX_G 64
+kernel void random_bucketing(
+    device const float*  dataset     [[ buffer(0) ]],  // N×D row-major
+    device const uint*   rperm       [[ buffer(1) ]],  // N shuffled indices
+    device uint*         graph       [[ buffer(2) ]],  // N×G (mutable)
+    device float*        graph_dist  [[ buffer(3) ]],  // N×G (mutable)
+    constant uint&       N           [[ buffer(4) ]],
+    constant uint&       D           [[ buffer(5) ]],
+    constant uint&       G           [[ buffer(6) ]],
+    constant uint&       rbsz        [[ buffer(7) ]],
+    uint bucket_id  [[ threadgroup_position_in_grid ]],
+    uint t_id       [[ thread_position_in_threadgroup ]])
+{
+    const uint start = bucket_id * rbsz;
+    if (start >= N) return;
+    const uint end = min(start + rbsz, N);
+    const uint Bs  = end - start;
+    if (t_id >= Bs) return;
+
+    const uint vi   = rperm[start + t_id];
+    const uint D4   = D >> 2u;
+    const device float4* my_v = (const device float4*)(dataset + (ulong)vi * D);
+
+    // Top-G max-heap in registers (size bounded by RBUCKET_MAX_G)
+    float heap_d[RBUCKET_MAX_G];
+    uint  heap_n[RBUCKET_MAX_G];
+    const uint take = min(G, (uint)RBUCKET_MAX_G);
+    for (uint g = 0; g < take; ++g) { heap_d[g] = INFINITY; heap_n[g] = 0xFFFFFFFFu; }
+
+    // Scan all Bs bucket vectors
+    for (uint b = 0; b < Bs; ++b) {
+        if (b == t_id) continue;
+        const uint nb = rperm[start + b];
+        const device float4* nb_v = (const device float4*)(dataset + (ulong)nb * D);
+        float dist = 0.f;
+        for (uint d4 = 0; d4 < D4; ++d4) {
+            float4 delta = my_v[d4] - nb_v[d4];
+            dist += dot(delta, delta);
+        }
+        // Insert into max-heap: evict worst if dist improves it
+        float worst = heap_d[0]; uint wi = 0u;
+        for (uint g = 1u; g < take; ++g) {
+            if (heap_d[g] > worst) { worst = heap_d[g]; wi = g; }
+        }
+        if (dist < worst) { heap_d[wi] = dist; heap_n[wi] = nb; }
+    }
+
+    // Merge heap into global graph[vi] (no conflict: buckets are non-overlapping)
+    const ulong row = (ulong)vi * G;
+    for (uint h = 0; h < take; ++h) {
+        if (heap_n[h] == 0xFFFFFFFFu) continue;
+        float worst = graph_dist[row]; uint wi = 0u;
+        for (uint g = 1u; g < G; ++g) {
+            if (graph_dist[row + g] > worst) { worst = graph_dist[row + g]; wi = g; }
+        }
+        if (heap_d[h] < worst) {
+            graph[row + wi]      = heap_n[h];
+            graph_dist[row + wi] = heap_d[h];
+        }
+    }
+}
+
 // P4: brute-force L2 distance — one thread per base vector.
 // Each thread computes squared Euclidean distance from base vector gid to the query.
 // dataset: N x D row-major float32

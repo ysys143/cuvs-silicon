@@ -23,9 +23,10 @@ struct MetalContext::Impl {
     id<MTLDevice>               device   = nil;
     id<MTLCommandQueue>         queue    = nil;
     id<MTLLibrary>              library  = nil;
-    id<MTLComputePipelineState> pso_copy         = nil;
-    id<MTLComputePipelineState> pso_beam_search  = nil;
-    id<MTLComputePipelineState> pso_nn_descent   = nil;
+    id<MTLComputePipelineState> pso_copy             = nil;
+    id<MTLComputePipelineState> pso_beam_search      = nil;
+    id<MTLComputePipelineState> pso_nn_descent        = nil;
+    id<MTLComputePipelineState> pso_random_bucketing  = nil;
     bool                        available = false;
     std::string                 chip_model_str;
 
@@ -61,9 +62,10 @@ MetalContext::MetalContext() : impl_(new Impl) {
             NSError* e = nil;
             return [impl_->device newComputePipelineStateWithFunction:fn error:&e];
         };
-        impl_->pso_copy        = make_pso(@"copy_kernel");
-        impl_->pso_beam_search = make_pso(@"cagra_beam_search");
-        impl_->pso_nn_descent  = make_pso(@"nn_descent");
+        impl_->pso_copy             = make_pso(@"copy_kernel");
+        impl_->pso_beam_search      = make_pso(@"cagra_beam_search");
+        impl_->pso_nn_descent       = make_pso(@"nn_descent");
+        impl_->pso_random_bucketing = make_pso(@"random_bucketing");
 
         impl_->chip_model_str = impl_->device.name.UTF8String;
         impl_->available      = true;
@@ -461,56 +463,61 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
         }
     } // end IVF seeding
 
-    // ── Phase 1b: Random bucketing pass (large N only) ─────────────────
-    // IVF seeding produces locally well-connected clusters but lacks
-    // cross-cluster edges. One random bucketing pass adds global diversity
-    // (bridges between unrelated clusters) that nn-descent needs to converge.
-    if (N > FULL_SEEDING_LIMIT) {
-        const int64_t rbsz = 256;  // 256×256×4=256KB bcross fits in L2 cache
-        std::vector<int64_t> rperm(static_cast<size_t>(N));
-        std::iota(rperm.begin(), rperm.end(), 0LL);
+    // ── Phase 1b: Random bucketing pass (GPU-accelerated) ─────────────────
+    // IVF seeding lacks cross-cluster edges. One random bucketing pass adds
+    // global diversity. Metal kernel: 1 threadgroup per bucket, 1 thread per
+    // vector — 391 buckets dispatched in parallel on GPU.
+    if (N > FULL_SEEDING_LIMIT && impl_->pso_random_bucketing) {
+        constexpr uint32_t rbsz = 256;
+
+        // Fisher-Yates shuffle on CPU (O(N), ~1ms)
+        std::vector<uint32_t> rperm(static_cast<size_t>(N));
+        std::iota(rperm.begin(), rperm.end(), 0u);
         uint64_t rrng = 0xFEDCBA9876543210ULL;
         for (int64_t i = N-1; i > 0; --i) {
             rrng = rrng * 6364136223846793005ULL + 1442695040888963407ULL;
             int64_t j = (int64_t)(rrng >> 33) % (i+1);
             std::swap(rperm[static_cast<size_t>(i)], rperm[static_cast<size_t>(j)]);
         }
-        for (int64_t start = 0; start < N; start += rbsz) {
-            const int64_t end = std::min(start + rbsz, N);
-            const int64_t Bs  = end - start;
-            std::vector<float> bdata(static_cast<size_t>(Bs * D));
-            for (int64_t b = 0; b < Bs; ++b)
-                std::copy_n(dataset + rperm[static_cast<size_t>(start+b)]*D,
-                            static_cast<size_t>(D), bdata.data() + b*D);
-            std::vector<float> bcross(static_cast<size_t>(Bs * Bs));
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        (int)Bs, (int)Bs, (int)D,
-                        1.0f, bdata.data(), (int)D, bdata.data(), (int)D,
-                        0.0f, bcross.data(), (int)Bs);
-            std::vector<uint32_t> bidx(static_cast<size_t>(Bs));
-            for (int64_t b = 0; b < Bs; ++b) {
-                const int64_t vi = rperm[static_cast<size_t>(start+b)];
-                const float ni  = norms[static_cast<size_t>(vi)];
-                const float* cr = bcross.data() + b*Bs;
-                std::iota(bidx.begin(), bidx.end(), 0u);
-                bidx[static_cast<size_t>(b)] = bidx[static_cast<size_t>(Bs-1)];
-                const int64_t take = std::min((int64_t)G, Bs-1);
-                std::partial_sort(bidx.begin(), bidx.begin()+take,
-                                  bidx.begin()+Bs-1,
-                    [&](uint32_t a, uint32_t bb) {
-                        const int64_t ga = rperm[static_cast<size_t>(start+a)];
-                        const int64_t gb = rperm[static_cast<size_t>(start+bb)];
-                        return ni-2.f*cr[a]+norms[static_cast<size_t>(ga)] <
-                               ni-2.f*cr[bb]+norms[static_cast<size_t>(gb)];
-                    });
-                for (int64_t t = 0; t < take; ++t) {
-                    uint32_t m = bidx[static_cast<size_t>(t)];
-                    uint32_t nbr = static_cast<uint32_t>(
-                        rperm[static_cast<size_t>(start+m)]);
-                    float d = ni-2.f*cr[m]+norms[static_cast<size_t>(nbr)];
-                    insert_neighbor(vi, nbr, d);
-                }
-            }
+
+        @autoreleasepool {
+            const NSUInteger n_buckets = (static_cast<NSUInteger>(N) + rbsz - 1) / rbsz;
+
+            auto buf_dataset = make_shared_buf(impl_->device, dataset,
+                                   (NSUInteger)(N * D * sizeof(float)));
+            auto buf_rperm   = make_shared_buf(impl_->device, rperm.data(),
+                                   (NSUInteger)(N * sizeof(uint32_t)));
+            auto buf_graph   = [impl_->device
+                newBufferWithBytes:graph.data()
+                length:(NSUInteger)(N * G * sizeof(uint32_t))
+                options:MTLResourceStorageModeShared];
+            auto buf_gdist   = [impl_->device
+                newBufferWithBytes:graph_dist.data()
+                length:(NSUInteger)(N * G * sizeof(float))
+                options:MTLResourceStorageModeShared];
+
+            uint32_t uN = (uint32_t)N, uD = (uint32_t)D, uG = G;
+            auto cmd = [impl_->queue commandBuffer];
+            auto enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:impl_->pso_random_bucketing];
+            [enc setBuffer:buf_dataset offset:0 atIndex:0];
+            [enc setBuffer:buf_rperm   offset:0 atIndex:1];
+            [enc setBuffer:buf_graph   offset:0 atIndex:2];
+            [enc setBuffer:buf_gdist   offset:0 atIndex:3];
+            [enc setBytes:&uN   length:4 atIndex:4];
+            [enc setBytes:&uD   length:4 atIndex:5];
+            [enc setBytes:&uG   length:4 atIndex:6];
+            [enc setBytes:&rbsz length:4 atIndex:7];
+            [enc dispatchThreadgroups:MTLSizeMake(n_buckets, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(rbsz, 1, 1)];
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+
+            std::copy_n((const uint32_t*)buf_graph.contents,
+                        static_cast<size_t>(N * G), graph.data());
+            std::copy_n((const float*)buf_gdist.contents,
+                        static_cast<size_t>(N * G), graph_dist.data());
         }
     }
 
