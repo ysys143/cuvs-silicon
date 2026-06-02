@@ -73,15 +73,18 @@ class index {
   }
 
   // Navigation nodes: a subset of dataset indices used as entry points.
-  // During search, the closest navigation node to the query is found via
-  // brute-force (cheap for small n_nav), giving a much better starting point.
-  const std::vector<IndexT>& nav_nodes()   const noexcept { return nav_nodes_; }
+  // nav_vectors_ caches the actual vectors (N_NAV × D float32) so that
+  // cblas_sgemm can compute all Q×N_NAV distances in one AMX-accelerated call.
+  const std::vector<IndexT>&  nav_nodes()    const noexcept { return nav_nodes_; }
+  const std::vector<DataT>&   nav_vectors()  const noexcept { return nav_vectors_; }
   void set_nav_nodes(std::vector<IndexT> n) { nav_nodes_ = std::move(n); }
+  void set_nav_vectors(std::vector<DataT> v) { nav_vectors_ = std::move(v); }
 
  private:
   std::vector<DataT>    dataset_;
   std::vector<IndexT>   knn_graph_;   // N × graph_degree, row-major
-  std::vector<IndexT>   nav_nodes_;   // sqrt(N) entry points for search
+  std::vector<IndexT>   nav_nodes_;   // sqrt(N) entry point indices
+  std::vector<DataT>    nav_vectors_; // N_NAV × D, row-major (cached for sgemm)
   std::uint32_t         graph_degree_ = 0;
   std::int64_t          rows_ = 0;
   std::int64_t          cols_ = 0;

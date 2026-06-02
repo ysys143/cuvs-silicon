@@ -342,7 +342,9 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
                                     (NSUInteger)(N * sizeof(uint32_t)));
 
             uint32_t uN = (uint32_t)N, uD = (uint32_t)D, uG = G;
-            const NSUInteger threads = 1;  // single-threaded for correctness
+            // G threads per node: each thread handles G/G = 1 hop-2 neighbor
+            // set. Races on graph[] writes are benign (worst: miss one update).
+            const NSUInteger threads = std::min(G, 32u);
 
             for (uint32_t iter = 0; iter < n_descent_iters; ++iter) {
                 memset(buf_improved.contents, 0,

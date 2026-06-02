@@ -66,7 +66,17 @@ index<float, std::uint32_t> build<float, std::int64_t>(
       for (int64_t i = 0; i < n_nav; ++i)
         nav[static_cast<std::size_t>(i)] =
             static_cast<std::uint32_t>(i * step);
+      // Build nav_vectors matrix (N_NAV × D) — cached for AMX-accelerated
+      // cblas_sgemm lookup at search time. Avoids repeated gather per query.
+      std::vector<float> nav_vecs(static_cast<std::size_t>(n_nav * D));
+      for (int64_t i = 0; i < n_nav; ++i) {
+        const std::uint32_t ni = nav[static_cast<std::size_t>(i)];
+        std::copy_n(data + ni * D,
+                    static_cast<std::size_t>(D),
+                    nav_vecs.data() + i * D);
+      }
       idx.set_nav_nodes(std::move(nav));
+      idx.set_nav_vectors(std::move(nav_vecs));
     }
   }
 #endif
@@ -112,25 +122,53 @@ void search<float, std::uint32_t, std::int64_t>(
       const bool has_graph = (index.graph_degree() > 0 &&
                               !index.knn_graph().empty());
       if (has_graph) {
-        // Compute per-query entry points from navigation nodes.
-        // For each query, find the closest nav node via CPU brute-force.
-        const auto& nav = index.nav_nodes();
+        // Compute per-query entry points via AMX-accelerated cblas_sgemm.
+        // cross[Q×N_NAV] = queries[Q×D] @ nav_vectors[N_NAV×D]^T
+        // dist[q,i] = ||q||^2 - 2*cross[q,i] + ||nav_i||^2 → argmin per row.
+        const auto& nav     = index.nav_nodes();
+        const auto& nav_vec = index.nav_vectors();
         std::vector<std::uint32_t> entry_nodes(
             static_cast<std::size_t>(query_count), 0u);
-        if (!nav.empty()) {
-          const float* qptr = queries.data_handle();
+        if (!nav.empty() && !nav_vec.empty()) {
+          const std::int64_t n_nav = static_cast<std::int64_t>(nav.size());
+          const float* qptr        = queries.data_handle();
+
+          // Query norms
+          std::vector<float> q_norms(static_cast<std::size_t>(query_count));
           for (std::int64_t q = 0; q < query_count; ++q) {
+            float s = 0.f;
             const float* qv = qptr + q * dimension;
+            for (std::int64_t d = 0; d < dimension; ++d) s += qv[d] * qv[d];
+            q_norms[static_cast<std::size_t>(q)] = s;
+          }
+          // Nav norms
+          std::vector<float> n_norms(static_cast<std::size_t>(n_nav));
+          for (std::int64_t i = 0; i < n_nav; ++i) {
+            float s = 0.f;
+            const float* nv = nav_vec.data() + i * dimension;
+            for (std::int64_t d = 0; d < dimension; ++d) s += nv[d] * nv[d];
+            n_norms[static_cast<std::size_t>(i)] = s;
+          }
+          // Cross products: cross[Q×N_NAV] = queries @ nav_vectors^T  (AMX)
+          std::vector<float> cross(
+              static_cast<std::size_t>(query_count * n_nav));
+          cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                      (int)query_count, (int)n_nav, (int)dimension,
+                      1.0f, qptr, (int)dimension,
+                      nav_vec.data(), (int)dimension,
+                      0.0f, cross.data(), (int)n_nav);
+          // argmin per query
+          for (std::int64_t q = 0; q < query_count; ++q) {
             float best_d = std::numeric_limits<float>::infinity();
             std::uint32_t best_n = nav[0];
-            for (auto ni : nav) {
-              const float* nv = dataset.data() + ni * dimension;
-              float d = 0.f;
-              for (std::int64_t dd = 0; dd < dimension; ++dd) {
-                float delta = qv[dd] - nv[dd];
-                d += delta * delta;
+            const float qn = q_norms[static_cast<std::size_t>(q)];
+            for (std::int64_t i = 0; i < n_nav; ++i) {
+              float d = qn - 2.f * cross[static_cast<std::size_t>(q * n_nav + i)]
+                        + n_norms[static_cast<std::size_t>(i)];
+              if (d < best_d) {
+                best_d = d;
+                best_n = nav[static_cast<std::size_t>(i)];
               }
-              if (d < best_d) { best_d = d; best_n = ni; }
             }
             entry_nodes[static_cast<std::size_t>(q)] = best_n;
           }
