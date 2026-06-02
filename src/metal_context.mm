@@ -446,6 +446,59 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
         }
     } // end IVF seeding
 
+    // ── Phase 1b: Random bucketing pass (large N only) ─────────────────
+    // IVF seeding produces locally well-connected clusters but lacks
+    // cross-cluster edges. One random bucketing pass adds global diversity
+    // (bridges between unrelated clusters) that nn-descent needs to converge.
+    if (N > FULL_SEEDING_LIMIT) {
+        const int64_t rbsz = std::max((int64_t)G * 32, (int64_t)8192);
+        std::vector<int64_t> rperm(static_cast<size_t>(N));
+        std::iota(rperm.begin(), rperm.end(), 0LL);
+        uint64_t rrng = 0xFEDCBA9876543210ULL;
+        for (int64_t i = N-1; i > 0; --i) {
+            rrng = rrng * 6364136223846793005ULL + 1442695040888963407ULL;
+            int64_t j = (int64_t)(rrng >> 33) % (i+1);
+            std::swap(rperm[static_cast<size_t>(i)], rperm[static_cast<size_t>(j)]);
+        }
+        for (int64_t start = 0; start < N; start += rbsz) {
+            const int64_t end = std::min(start + rbsz, N);
+            const int64_t Bs  = end - start;
+            std::vector<float> bdata(static_cast<size_t>(Bs * D));
+            for (int64_t b = 0; b < Bs; ++b)
+                std::copy_n(dataset + rperm[static_cast<size_t>(start+b)]*D,
+                            static_cast<size_t>(D), bdata.data() + b*D);
+            std::vector<float> bcross(static_cast<size_t>(Bs * Bs));
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        (int)Bs, (int)Bs, (int)D,
+                        1.0f, bdata.data(), (int)D, bdata.data(), (int)D,
+                        0.0f, bcross.data(), (int)Bs);
+            std::vector<uint32_t> bidx(static_cast<size_t>(Bs));
+            for (int64_t b = 0; b < Bs; ++b) {
+                const int64_t vi = rperm[static_cast<size_t>(start+b)];
+                const float ni  = norms[static_cast<size_t>(vi)];
+                const float* cr = bcross.data() + b*Bs;
+                std::iota(bidx.begin(), bidx.end(), 0u);
+                bidx[static_cast<size_t>(b)] = bidx[static_cast<size_t>(Bs-1)];
+                const int64_t take = std::min((int64_t)G, Bs-1);
+                std::partial_sort(bidx.begin(), bidx.begin()+take,
+                                  bidx.begin()+Bs-1,
+                    [&](uint32_t a, uint32_t bb) {
+                        const int64_t ga = rperm[static_cast<size_t>(start+a)];
+                        const int64_t gb = rperm[static_cast<size_t>(start+bb)];
+                        return ni-2.f*cr[a]+norms[static_cast<size_t>(ga)] <
+                               ni-2.f*cr[bb]+norms[static_cast<size_t>(gb)];
+                    });
+                for (int64_t t = 0; t < take; ++t) {
+                    uint32_t m = bidx[static_cast<size_t>(t)];
+                    uint32_t nbr = static_cast<uint32_t>(
+                        rperm[static_cast<size_t>(start+m)]);
+                    float d = ni-2.f*cr[m]+norms[static_cast<size_t>(nbr)];
+                    insert_neighbor(vi, nbr, d);
+                }
+            }
+        }
+    }
+
     // ── Phase 2: nn-descent refinement via Metal kernel ───────────────
     if (impl_->pso_nn_descent && n_descent_iters > 0) {
         @autoreleasepool {
