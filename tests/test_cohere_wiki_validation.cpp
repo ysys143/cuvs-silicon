@@ -105,8 +105,8 @@ static BenchResult run_metal_bench(
                 idx.graph_degree() > 0 ? "yes" : "no");
 
     cuvs::neighbors::cagra::search_params sp;
-    sp.itopk_size     = 512;
-    sp.max_iterations = 600;
+    sp.itopk_size     = 64;
+    sp.max_iterations = 200;
 
     std::vector<uint32_t> neighbors(static_cast<size_t>(Q * K));
     std::vector<float>    distances(static_cast<size_t>(Q * K));
