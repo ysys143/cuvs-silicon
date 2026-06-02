@@ -225,10 +225,6 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
     std::vector<float> graph_dist(static_cast<size_t>(N) * G,
                                    std::numeric_limits<float>::infinity());
 
-    fprintf(stderr, "[build_knn_graph] N=%lld D=%lld G=%u nd_iters=%u\n",
-            (long long)N, (long long)D, G, n_descent_iters);
-    fflush(stderr);
-
     std::vector<float> norms(static_cast<size_t>(N));
     for (int64_t i = 0; i < N; ++i) {
         float s = 0.f; const float* v = dataset + i * D;
@@ -244,8 +240,6 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
         }
         if (dist < worst) { graph[row+worst_g] = nbr; graph_dist[row+worst_g] = dist; }
     };
-
-    fprintf(stderr, "[build_knn_graph] norms done, starting seeding\n"); fflush(stderr);
 
     if (N <= FULL_SEEDING_LIMIT) {
         // Exact N×N seeding via cblas_sgemm (AMX)
@@ -350,8 +344,6 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
                                 centroids.data() + k*D, 1);
             }
         }
-
-        fprintf(stderr, "[build_knn_graph] K-means done, building clusters\n"); fflush(stderr);
 
         // ── Build cluster membership lists ─────────────────────────────
         std::vector<std::vector<uint32_t>> clusters(static_cast<size_t>(K));
@@ -468,7 +460,6 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
             }
         }
     } // end IVF seeding
-    fprintf(stderr, "[build_knn_graph] IVF seeding done\n"); fflush(stderr);
 
     // ── Phase 1b: Random bucketing pass (large N only) ─────────────────
     // IVF seeding produces locally well-connected clusters but lacks
@@ -522,8 +513,6 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
             }
         }
     }
-
-    fprintf(stderr, "[build_knn_graph] random bucketing done, starting nn-descent\n"); fflush(stderr);
 
     // ── Phase 2: nn-descent refinement via Metal kernel ───────────────
     if (impl_->pso_nn_descent && n_descent_iters > 0) {
