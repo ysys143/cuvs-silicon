@@ -317,8 +317,8 @@ void save_index(const index<float, std::uint32_t>& idx, const std::string& path)
     write_val<std::uint32_t>(f,
         (has_dataset ? 0x1u : 0u) | (has_nav ? 0x2u : 0u));
 
-    write_vec_u32(f, idx.knn_graph());
     if (has_dataset) write_vec_f32(f, idx.dataset());
+    write_vec_u32(f, idx.knn_graph());
     if (has_nav) {
         write_val<std::uint32_t>(f, static_cast<std::uint32_t>(idx.nav_nodes().size()));
         write_vec_u32(f, idx.nav_nodes());
