@@ -42,12 +42,13 @@ struct MetalContext::Impl {
     int64_t            cross_buf_Q = 0, cross_buf_N = 0;
 
     // Metal buffer cache for brute-force GPU search.
-    id<MTLBuffer>   buf_dataset_metal = nil;
-    id<MTLBuffer>   buf_d_norms_metal = nil;
-    const float*    buf_dataset_ptr   = nullptr;
-    int64_t         buf_dataset_N     = 0, buf_dataset_D = 0;
-    id<MTLBuffer>   buf_cross_metal   = nil;
-    int64_t         buf_cross_Q       = 0, buf_cross_N   = 0;
+    id<MTLBuffer>   buf_dataset_metal    = nil;  // float32 (shared)
+    id<MTLBuffer>   buf_dataset_fp16     = nil;  // float16 (private) — halves matmul reads
+    id<MTLBuffer>   buf_d_norms_metal    = nil;
+    const float*    buf_dataset_ptr      = nullptr;
+    int64_t         buf_dataset_N        = 0, buf_dataset_D = 0;
+    id<MTLBuffer>   buf_cross_metal      = nil;
+    int64_t         buf_cross_Q          = 0, buf_cross_N   = 0;
 };
 
 // ── Constructor ───────────────────────────────────────────────────────────
@@ -147,8 +148,16 @@ uint64_t MetalContext::search_brute_force(
         // Cache dataset + d_norms Metal buffers
         if (impl_->buf_dataset_ptr != dataset ||
             impl_->buf_dataset_N != N || impl_->buf_dataset_D != D) {
+            // float32 shared buffer (for reference if needed)
             impl_->buf_dataset_metal = make_shared_buf(impl_->device, dataset,
                 (NSUInteger)(N * D * sizeof(float)));
+            // float16 private buffer — halves matmul memory reads (4GB→2GB)
+            impl_->buf_dataset_fp16 = [impl_->device
+                newBufferWithLength:(NSUInteger)(N * D * sizeof(__fp16))
+                options:MTLResourceStorageModeShared];
+            auto* fp16_ptr = reinterpret_cast<__fp16*>(impl_->buf_dataset_fp16.contents);
+            for (int64_t i = 0; i < N * D; ++i)
+                fp16_ptr[i] = (__fp16)dataset[i];
             impl_->cached_dataset_norms = compute_row_norms(dataset, N, D);
             impl_->buf_d_norms_metal = make_shared_buf(impl_->device,
                 impl_->cached_dataset_norms.data(),
@@ -167,31 +176,36 @@ uint64_t MetalContext::search_brute_force(
             impl_->buf_cross_Q = Q; impl_->buf_cross_N = N;
         }
 
-        auto buf_queries  = make_shared_buf(impl_->device, queries,
-                                (NSUInteger)(Q * D * sizeof(float)));
         auto buf_out_idx  = make_empty_buf(impl_->device,
                                 (NSUInteger)(Q * K * sizeof(uint32_t)));
         auto buf_out_dist = make_empty_buf(impl_->device,
                                 (NSUInteger)(Q * K * sizeof(float)));
 
-        // Precompute query norms (tiny: Q×4 bytes)
+        // float16 query buffer (Q×D × 2 bytes = tiny)
+        auto buf_queries_fp16 = [impl_->device
+            newBufferWithLength:(NSUInteger)(Q * D * sizeof(__fp16))
+            options:MTLResourceStorageModeShared];
+        auto* q16 = reinterpret_cast<__fp16*>(buf_queries_fp16.contents);
+        for (int64_t i = 0; i < Q * D; ++i) q16[i] = (__fp16)queries[i];
+
+        // Precompute query norms in float32 (precise)
         const auto q_norms_vec = compute_row_norms(queries, Q, D);
         auto buf_q_norms = make_shared_buf(impl_->device, q_norms_vec.data(),
                                (NSUInteger)(Q * sizeof(float)));
 
-        // ── Pass 1: MPS matmul → cross (GPU-private buffer) ──────────────
+        // ── Pass 1: MPS float16×float16→float32 matmul ───────────────────
         MPSMatrixDescriptor* dQ = [MPSMatrixDescriptor
             matrixDescriptorWithRows:(NSUInteger)Q columns:(NSUInteger)D
-            rowBytes:(NSUInteger)(D*sizeof(float)) dataType:MPSDataTypeFloat32];
+            rowBytes:(NSUInteger)(D*sizeof(__fp16)) dataType:MPSDataTypeFloat16];
         MPSMatrixDescriptor* dD = [MPSMatrixDescriptor
             matrixDescriptorWithRows:(NSUInteger)N columns:(NSUInteger)D
-            rowBytes:(NSUInteger)(D*sizeof(float)) dataType:MPSDataTypeFloat32];
+            rowBytes:(NSUInteger)(D*sizeof(__fp16)) dataType:MPSDataTypeFloat16];
         MPSMatrixDescriptor* dC = [MPSMatrixDescriptor
             matrixDescriptorWithRows:(NSUInteger)Q columns:(NSUInteger)N
             rowBytes:(NSUInteger)(N*sizeof(float)) dataType:MPSDataTypeFloat32];
 
-        MPSMatrix* matQ = [[MPSMatrix alloc] initWithBuffer:buf_queries           descriptor:dQ];
-        MPSMatrix* matD = [[MPSMatrix alloc] initWithBuffer:impl_->buf_dataset_metal descriptor:dD];
+        MPSMatrix* matQ = [[MPSMatrix alloc] initWithBuffer:buf_queries_fp16      descriptor:dQ];
+        MPSMatrix* matD = [[MPSMatrix alloc] initWithBuffer:impl_->buf_dataset_fp16 descriptor:dD];
         MPSMatrix* matC = [[MPSMatrix alloc] initWithBuffer:impl_->buf_cross_metal  descriptor:dC];
 
         MPSMatrixMultiplication* gemm = [[MPSMatrixMultiplication alloc]
