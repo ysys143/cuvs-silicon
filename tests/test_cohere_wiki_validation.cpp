@@ -15,9 +15,9 @@
 //   rows * cols * sizeof(element) bytes  (float32 for base/queries, int32 for gt)
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
-#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -26,13 +26,9 @@
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 #include <unistd.h>
-
-static void build_timeout_handler(int) {
-    std::fprintf(stderr, "\n[TIMEOUT] Graph build exceeded time limit. Aborting.\n");
-    _exit(1);
-}
 
 #include <cuvs/neighbors/cagra.hpp>
 #include <raft/core/resources.hpp>
@@ -99,14 +95,22 @@ static BenchResult run_metal_bench(
     cuvs::neighbors::cagra::index_params ip;
     ip.graph_degree = 64;
 
-    std::printf("  Building CAGRA graph (GPU)...\n");
-    std::signal(SIGALRM, build_timeout_handler);
-    alarm(120);  // abort if build takes > 120s
+    std::printf("  Building CAGRA graph (GPU)...\n"); fflush(stdout);
+    std::atomic<bool> build_done{false};
+    std::thread watchdog([&build_done]() {
+        for (int i = 0; i < 120; ++i) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (build_done.load()) return;
+        }
+        std::fprintf(stderr, "\n[TIMEOUT] Build exceeded 120s. Aborting.\n");
+        _exit(1);
+    });
     const auto t_build0 = Clock::now();
     auto idx = cuvs::neighbors::cagra::build(
         res, ip,
         raft::device_matrix_view<const float, std::int64_t>(base, N, D));
-    alarm(0);
+    build_done.store(true);
+    watchdog.join();
     const double build_ms =
         std::chrono::duration<double, std::milli>(Clock::now() - t_build0).count();
     std::printf("  Build time: %.2fs  graph_degree=%u  has_graph=%s\n",
