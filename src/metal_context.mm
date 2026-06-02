@@ -386,11 +386,23 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
             if (own.empty()) continue;
 
             // Gather probe set: own + near clusters
+            // Cap at MAX_PROBE to prevent degenerate large clusters
+            // (K-means init collisions can create unbalanced clusters).
+            constexpr int64_t MAX_PROBE = 8192;
             std::vector<uint32_t> probe;
-            probe.insert(probe.end(), own.begin(), own.end());
-            for (auto nk : near_clusters[static_cast<size_t>(k)])
-                for (auto v : clusters[static_cast<size_t>(nk)])
+            probe.reserve(std::min(MAX_PROBE,
+                static_cast<int64_t>((1 + n_probe) * (N / K + 1))));
+            for (auto v : own) {
+                if (static_cast<int64_t>(probe.size()) >= MAX_PROBE) break;
+                probe.push_back(v);
+            }
+            for (auto nk : near_clusters[static_cast<size_t>(k)]) {
+                for (auto v : clusters[static_cast<size_t>(nk)]) {
+                    if (static_cast<int64_t>(probe.size()) >= MAX_PROBE) break;
                     probe.push_back(v);
+                }
+                if (static_cast<int64_t>(probe.size()) >= MAX_PROBE) break;
+            }
             const int64_t M  = static_cast<int64_t>(probe.size());
             const int64_t nk = static_cast<int64_t>(own.size());
             if (M <= 1) continue;
