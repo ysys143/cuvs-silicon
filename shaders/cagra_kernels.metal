@@ -237,11 +237,14 @@ kernel void nn_descent(
             }
             if (already_present) continue;
 
-            // Compute L2 distance from node to candidate
+            // Compute L2 distance: float4 vectorization (4× SIMD throughput)
             float dist = 0.f;
-            for (uint d = 0; d < D; ++d) {
-                float delta = dataset[dBase + d] - dataset[(ulong)candidate * D + d];
-                dist += delta * delta;
+            const ulong cBase = (ulong)candidate * D;
+            const device float4* qv = (const device float4*)(dataset + dBase);
+            const device float4* cv = (const device float4*)(dataset + cBase);
+            for (uint d4 = 0; d4 < D / 4; ++d4) {
+                float4 delta = qv[d4] - cv[d4];
+                dist += dot(delta, delta);
             }
 
             // Find worst current neighbor
