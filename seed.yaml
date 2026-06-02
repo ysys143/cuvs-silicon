@@ -1,0 +1,183 @@
+goal: Build cuVS-compatible Apple Silicon Metal implementation of CAGRA ANN search
+  acceleration — GPU kernels in Metal Shading Language (.metal files), host code
+  using Metal framework (MTLDevice/MTLCommandQueue/MTLComputePipelineState), cuVS
+  CAGRA C++ header interface for FAISS compatibility, and SIFT-1M benchmark surpassing
+  Faiss-mlx on recall@10, QPS, and p99 latency when both achieve recall@10 >= 0.90
+task_type: code
+brownfield_context:
+  project_type: greenfield
+  context_references: []
+  existing_patterns: []
+  existing_dependencies: []
+constraints:
+- MVP search MUST execute on Metal GPU; CPU fallback for search is not acceptable
+- MVP index build MAY use CPU-assisted graph construction such as hnswlib
+- MPS is permitted for distance computation only; beam search graph traversal must
+  use Metal Compute Shader GPU kernels
+- Must provide cuvs/neighbors/cagra.hpp with cuvs::neighbors::cagra namespace and
+  cagra::index<float,uint32_t> cagra::index_params cagra::search_params types
+- Must provide raft/core/resources.hpp as a header-only shim; must not link against
+  or require the RAFT runtime library
+- Must provide cuvs::neighbors::cagra::build(const raft::resources&, const index_params&,
+  raft::device_matrix_view<const float,int64_t> dataset) -> index<float,uint32_t>
+- Must provide cuvs::neighbors::cagra::search(const raft::resources&, const search_params&,
+  const index<float,uint32_t>&, raft::device_matrix_view<const float,int64_t> queries,
+  raft::device_matrix_view<uint32_t,int64_t> neighbors, raft::device_matrix_view<float,int64_t>
+  distances)
+- raft::device_matrix_view may be implemented as unified-memory pointer-plus-extents
+  on Apple Silicon; no CUDA device pointer required
+- Forbidden as cuvs-silicon implementation and runtime dependencies — CUDA runtime,
+  RAFT runtime library, MLX; benchmark harness may install Faiss-mlx for comparison
+  only
+- Serialization is excluded from MVP scope
+- Milvus and Lucene integration are excluded from MVP scope
+- GPU search kernels MUST be written in Metal Shading Language (MSL) and compiled
+  from .metal files using xcrun metal or CMake Metal shader compilation; no GPU
+  kernel may be implemented in plain C++ or as a CPU loop
+- Host-side Metal code MUST use the Metal framework — MTLDevice, MTLCommandQueue,
+  MTLComputePipelineState, MTLBuffer, MTLComputeCommandEncoder; import Metal in
+  all files that dispatch GPU work
+- CMakeLists.txt MUST link Metal.framework and CoreFoundation.framework and compile
+  .metal shader files into a metallib; the build must fail if no .metal files exist
+- cagra::search() MUST dispatch a MTLComputeCommandEncoder with at least one
+  compute kernel; any implementation that reduces entirely to std::sort,
+  std::partial_sort, or CPU-only loops in the search path is a build constraint
+  violation, not an acceptable MVP
+- TDD is required for every acceptance criterion — write a failing test first,
+  confirm it fails for the correct reason (not a compile error), then implement the
+  minimal code to make it pass; commit or checkpoint after each Red->Green transition
+- Tests that verify the Metal GPU path must assert actual GPU dispatch (not merely
+  correct output that a CPU fallback could also produce); CPU fallback must be
+  disabled or unreachable in Metal path tests
+roadmap:
+- 'v1.0: Pure Metal Compute Shader for full nn-descent graph construction and beam
+  search'
+- 'future: Milvus integration'
+- 'future: Apache Lucene integration'
+- 'future: Index serialization'
+acceptance_criteria:
+- faiss/gpu/cuvs/ in FAISS v1.8.0 compiles with FAISS_ENABLE_CUVS=ON linked against
+  cuvs-silicon; allowed changes are CMake FAISS_CUVS_LIBRARY path, include directories,
+  and link targets only; no FAISS .cpp or .h source files may be modified
+- faiss/gpu/test/TestGpuIndexCagra passes on Apple Silicon M-series without CUDA
+- Benchmark dataset is SIFT-1M 128-dimensional float32 L2
+- recall@10 >= 0.90 on SIFT-1M with 10000 queries
+- Benchmark uses batch_size=100 queries per call; p99 measured per batch over 10
+  measured iterations after 5 warmup iterations; latency unit is milliseconds per
+  batch
+- CPU HNSW baseline uses M=16 efConstruction=200 efSearch=128 single-threaded on
+  same machine
+- Metal GPU QPS > CPU HNSW QPS on the same machine
+- Benchmark hardware is Apple Silicon M-series M1 or later; exact chip model, GPU
+  core count, and unified memory size are reported
+- Benchmark OS is macOS 14 Sonoma or later; Xcode version reported
+- FAISS compatibility tested against FAISS v1.8.0 tag
+- Faiss-mlx benchmark uses IVFFlat index with nprobe tuned to reach recall@10 >= 0.90,
+  or Flat index if IVFFlat cannot reach threshold; batch_size=100; same hardware;
+  exact Faiss-mlx package version, release tag, and resolved dependencies recorded
+  in benchmark report
+- When both cuvs-silicon and Faiss-mlx achieve recall@10 >= 0.90, cuvs-silicon recall@10
+  >= Faiss-mlx recall@10 AND cuvs-silicon QPS > Faiss-mlx QPS AND cuvs-silicon p99
+  < Faiss-mlx p99
+- Reported metrics are QPS, p50 latency, p99 latency, recall@10, and index build
+  time as informational
+ontology_schema:
+  name: CuVSMetalCAGRAImplementation
+  description: Domain model for cuVS-compatible CAGRA on Apple Silicon Metal GPU
+  fields:
+  - name: api_surface
+    type: object
+    description: cuVS CAGRA C++ headers and function signatures
+    required: true
+  - name: device_memory_model
+    type: object
+    description: raft::device_matrix_view as unified-memory pointer-plus-extents
+    required: true
+  - name: backend
+    type: string
+    description: MPS for distance computation only; Metal Compute Shaders for beam search
+    required: true
+  - name: index_build
+    type: object
+    description: CAGRA graph construction — CPU-assisted in MVP
+    required: true
+  - name: search
+    type: object
+    description: CAGRA beam search — Metal Compute Shader GPU kernels required
+    required: true
+  - name: benchmark_protocol
+    type: object
+    description: SIFT-1M 128d float32 L2; batch_size=100; macOS 14+; FAISS v1.8.0
+    required: true
+  - name: baseline_cpu
+    type: object
+    description: CPU HNSW M=16 efConstruction=200 efSearch=128 single-threaded
+    required: true
+  - name: baseline_gpu
+    type: object
+    description: Faiss-mlx IVFFlat nprobe-tuned; same hardware
+    required: true
+  - name: metrics
+    type: object
+    description: QPS p50/p99 latency recall@10 build time
+    required: true
+  - name: out_of_scope
+    type: array
+    description: Excluded from MVP only — serialization Milvus Lucene GPU build
+    required: true
+  - name: dependency_exclusions
+    type: array
+    description: Forbidden as implementation deps — CUDA RAFT runtime MLX
+    required: true
+  - name: implementation_stage
+    type: string
+    description: v0.1 MPS-distance plus CPU-build
+    required: true
+  - name: compatibility_target
+    type: string
+    description: faiss/gpu/cuvs/ at FAISS v1.8.0
+    required: true
+  - name: tdd_methodology
+    type: object
+    description: Red-Green-Refactor cycle required; Metal GPU dispatch assertion required
+      in Metal path tests; CPU fallback disabled in Metal path tests
+    required: true
+evaluation_principles:
+- name: API compatibility
+  description: FAISS v1.8.0 gpu/cuvs/ compiles and TestGpuIndexCagra passes
+  weight: 0.25
+- name: Search correctness
+  description: recall@10 >= 0.90 on SIFT-1M float32 L2
+  weight: 0.20
+- name: Benchmark reproducibility
+  description: All parameters fixed and reported
+  weight: 0.15
+- name: Performance vs baselines
+  description: Metal GPU QPS > CPU HNSW; beats Faiss-mlx on recall QPS and p99
+  weight: 0.20
+- name: Architecture fit
+  description: No CUDA RAFT MLX deps; Metal Compute Shaders for beam search
+  weight: 0.10
+- name: TDD compliance
+  description: Each AC has a prior failing test; Metal path tests assert GPU dispatch;
+    no implementation without Red phase evidence
+  weight: 0.10
+exit_conditions:
+- name: Full pass
+  description: FAISS integration, correctness, and performance vs both baselines all satisfied
+  criteria: TestGpuIndexCagra passes; recall@10 >= 0.90; Metal GPU QPS > CPU HNSW;
+    cuvs-silicon beats Faiss-mlx on recall QPS and p99
+- name: Scope complete
+  description: All MVP API components are implemented and FAISS integration test passes
+  criteria: build search index_params search_params raft::resources header-only shim
+    all implemented; FAISS v1.8.0 integration test passes
+- name: Stop for redesign
+  description: Core cuVS API compatibility strategy is invalidated by CUDA type dependency
+  criteria: FAISS v1.8.0 cuVS integration cannot be satisfied without CUDA-specific
+    types that cannot be abstracted for Apple Silicon unified memory
+metadata:
+  seed_id: seed_4fd4bb55deea
+  version: 1.6.0
+  ambiguity_score: 0.16
+  interview_id: interview_20260531_143340
+  notes: v1.6.0 adds Metal MSL/framework concrete constraints and TDD methodology

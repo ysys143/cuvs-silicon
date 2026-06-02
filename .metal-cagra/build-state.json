@@ -1,0 +1,88 @@
+{
+  "schema_version": "1.0",
+  "last_updated": "2026-06-01T02:40:15.035513Z",
+  "tdd_phase": {
+    "current_step": "P8",
+    "phase": "Green"
+  },
+  "steps": {
+    "P0": {
+      "name": "CMake Metal support",
+      "status": "green",
+      "last_test_run": "2026-06-01T02:40:15.035513Z",
+      "test_result": "passed"
+    },
+    "P1": {
+      "name": "Metal runtime init",
+      "status": "green",
+      "last_test_run": "2026-06-01T02:40:15.035513Z",
+      "test_result": "passed"
+    },
+    "P2": {
+      "name": "MTLBuffer bridging",
+      "status": "green",
+      "last_test_run": "2026-06-01T02:40:15.035513Z",
+      "test_result": "passed"
+    },
+    "P3": {
+      "name": "Trivial GPU kernel (copy)",
+      "status": "green",
+      "last_test_run": "2026-06-01T02:40:15.035513Z",
+      "test_result": "passed"
+    },
+    "P4": {
+      "name": "L2 distance GPU kernel",
+      "status": "green",
+      "last_test_run": "2026-06-01T02:40:15.035513Z",
+      "test_result": "passed"
+    },
+    "P5": {
+      "name": "Top-K CPU argmin",
+      "status": "green",
+      "last_test_run": "2026-06-01T02:40:15.035513Z",
+      "test_result": "passed"
+    },
+    "P6": {
+      "name": "Single-query brute-force Metal",
+      "status": "green",
+      "last_test_run": "2026-06-01T02:40:15.035513Z",
+      "test_result": "passed"
+    },
+    "P7": {
+      "name": "Batched Q-query Metal (2D)",
+      "status": "green",
+      "last_test_run": "2026-06-01T02:40:15.035513Z",
+      "test_result": "passed"
+    },
+    "P8": {
+      "name": "cagra::search() \uc5f0\uacb0 \u2192 Green",
+      "status": "green",
+      "last_test_run": "2026-06-01T02:40:15.035513Z",
+      "test_result": "passed"
+    }
+  },
+  "metal_device": {
+    "available": true,
+    "chip_model": "Apple M3 Max",
+    "gpu_core_count": null,
+    "unified_memory_bytes": 38654705664,
+    "detected_at": "2026-06-01T02:40:15.035513Z"
+  },
+  "build_artifacts": {
+    "libmetal_cagra_context.a": {
+      "exists": true,
+      "path": "build/libmetal_cagra_context.a"
+    },
+    "cagra_kernels.metallib": {
+      "exists": true,
+      "path": "build/cagra_kernels.metallib"
+    }
+  },
+  "test_results": {
+    "metal_search_dispatches_gpu": {
+      "last_run": "2026-06-01T02:40:15.035513Z",
+      "passed": true,
+      "dispatch_count": 4
+    }
+  }
+}

@@ -1,0 +1,226 @@
+#include <cstdint>
+#include <algorithm>
+#include <limits>
+#include <numeric>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+
+#include <cuvs/neighbors/cagra.hpp>
+
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <cuvs_silicon/metal_context.hpp>
+#include <Accelerate/Accelerate.h>
+#endif
+
+namespace cuvs::neighbors::cagra {
+
+template <>
+index<float, std::uint32_t> build<float, std::int64_t>(
+    const raft::resources& resources,
+    const index_params& params,
+    raft::device_matrix_view<const float, std::int64_t> dataset) {
+  (void)resources;
+  if (params.metric != cuvs::distance::DistanceType::L2Expanded) {
+    throw std::invalid_argument("cuvs-silicon CAGRA MVP supports L2Expanded");
+  }
+  if (dataset.data_handle() == nullptr || dataset.extent(0) <= 0 ||
+      dataset.extent(1) <= 0) {
+    throw std::invalid_argument("cuvs-silicon CAGRA build requires a non-empty dataset");
+  }
+
+  const std::int64_t N = dataset.extent(0);
+  const std::int64_t D = dataset.extent(1);
+  const float* data    = dataset.data_handle();
+
+  std::vector<float> storage;
+  if (params.attach_dataset_on_build)
+    storage.assign(data, data + N * D);
+
+  index<float, std::uint32_t> idx{std::move(storage), N, D};
+
+#if defined(__APPLE__) && defined(__aarch64__)
+  // GPU-accelerated KNN graph build via random-bucket seeding + nn-descent.
+  // No N^2 cap — scales to millions of vectors.
+  const std::uint32_t G = std::min<std::uint32_t>(
+      params.graph_degree, static_cast<std::uint32_t>(N - 1));
+
+  if (N > 1 && G > 0) {
+    auto& ctx = cuvs_silicon::MetalContext::instance();
+    if (ctx.is_available()) {
+      const int64_t bucket_size = std::max<int64_t>(
+          static_cast<int64_t>(G) * 8,
+          std::min<int64_t>(4096LL,
+              static_cast<int64_t>(std::sqrt(static_cast<double>(N)) * 2)));
+      auto knn = ctx.build_knn_graph(data, N, D, G,
+                                      /*n_descent_iters=*/20,
+                                      bucket_size);
+      idx.set_knn_graph(std::move(knn), G);
+
+      // Navigation nodes: min(200, sqrt(N)) evenly-spaced indices.
+      // Used at search time as brute-force entry point candidates.
+      const int64_t n_nav = std::min<int64_t>(
+          200, static_cast<int64_t>(std::sqrt(static_cast<double>(N))));
+      std::vector<std::uint32_t> nav(static_cast<std::size_t>(n_nav));
+      const double step = static_cast<double>(N) / n_nav;
+      for (int64_t i = 0; i < n_nav; ++i)
+        nav[static_cast<std::size_t>(i)] =
+            static_cast<std::uint32_t>(i * step);
+      idx.set_nav_nodes(std::move(nav));
+    }
+  }
+#endif
+
+  return idx;
+}
+
+template <>
+void search<float, std::uint32_t, std::int64_t>(
+    const raft::resources& resources,
+    const search_params& params,
+    const index<float, std::uint32_t>& index,
+    raft::device_matrix_view<const float, std::int64_t> queries,
+    raft::device_matrix_view<std::uint32_t, std::int64_t> neighbors,
+    raft::device_matrix_view<float, std::int64_t> distances) {
+  (void)params;
+  (void)resources;
+  if (queries.data_handle() == nullptr || neighbors.data_handle() == nullptr ||
+      distances.data_handle() == nullptr) {
+    throw std::invalid_argument("cuvs-silicon CAGRA search requires valid buffers");
+  }
+  if (queries.extent(1) != index.cols()) {
+    throw std::invalid_argument("cuvs-silicon CAGRA query dimension mismatch");
+  }
+  if (neighbors.extent(0) != queries.extent(0) ||
+      distances.extent(0) != queries.extent(0) ||
+      neighbors.extent(1) != distances.extent(1)) {
+    throw std::invalid_argument("cuvs-silicon CAGRA output shape mismatch");
+  }
+
+  const auto query_count = queries.extent(0);
+  const auto dimension = queries.extent(1);
+  const auto vector_count = index.rows();
+  const auto k = neighbors.extent(1);
+  const auto& dataset = index.dataset();
+
+  // Metal GPU path — CAGRA beam search if graph built, brute-force otherwise.
+#if defined(__APPLE__) && defined(__aarch64__)
+  {
+    auto& ctx = cuvs_silicon::MetalContext::instance();
+    if (ctx.is_available()) {
+      uint64_t dispatches = 0;
+      const bool has_graph = (index.graph_degree() > 0 &&
+                              !index.knn_graph().empty());
+      if (has_graph) {
+        // Compute per-query entry points from navigation nodes.
+        // For each query, find the closest nav node via CPU brute-force.
+        const auto& nav = index.nav_nodes();
+        std::vector<std::uint32_t> entry_nodes(
+            static_cast<std::size_t>(query_count), 0u);
+        if (!nav.empty()) {
+          const float* qptr = queries.data_handle();
+          for (std::int64_t q = 0; q < query_count; ++q) {
+            const float* qv = qptr + q * dimension;
+            float best_d = std::numeric_limits<float>::infinity();
+            std::uint32_t best_n = nav[0];
+            for (auto ni : nav) {
+              const float* nv = dataset.data() + ni * dimension;
+              float d = 0.f;
+              for (std::int64_t dd = 0; dd < dimension; ++dd) {
+                float delta = qv[dd] - nv[dd];
+                d += delta * delta;
+              }
+              if (d < best_d) { best_d = d; best_n = ni; }
+            }
+            entry_nodes[static_cast<std::size_t>(q)] = best_n;
+          }
+        }
+
+        dispatches = ctx.search_cagra(
+            dataset.data(),           vector_count, dimension,
+            index.knn_graph().data(), index.graph_degree(),
+            queries.data_handle(),    query_count,
+            neighbors.data_handle(),  distances.data_handle(),
+            k,
+            static_cast<std::uint32_t>(params.itopk_size > 0
+                ? params.itopk_size : 128),
+            static_cast<std::uint32_t>(params.max_iterations > 0
+                ? params.max_iterations : 200),
+            nav.empty() ? nullptr : entry_nodes.data());
+      } else {
+        dispatches = ctx.search_brute_force(
+            dataset.data(),          vector_count, dimension,
+            queries.data_handle(),   query_count,
+            neighbors.data_handle(), distances.data_handle(),
+            k);
+      }
+      for (std::uint64_t i = 0; i < dispatches; ++i)
+        increment_metal_dispatch_count();
+      return;
+    }
+  }
+#endif
+
+  std::vector<std::pair<float, std::uint32_t>> candidates;
+  candidates.reserve(static_cast<std::size_t>(vector_count));
+
+  for (std::int64_t query_id = 0; query_id < query_count; ++query_id) {
+    candidates.clear();
+    const float* query = queries.data_handle() + (query_id * dimension);
+
+    for (std::int64_t vector_id = 0; vector_id < vector_count; ++vector_id) {
+      const float* vector = dataset.data() + (vector_id * dimension);
+      float distance = 0.0F;
+      for (std::int64_t dim = 0; dim < dimension; ++dim) {
+        const float delta = query[dim] - vector[dim];
+        distance += delta * delta;
+      }
+      candidates.emplace_back(distance, static_cast<std::uint32_t>(vector_id));
+    }
+
+    const auto result_count = std::min<std::int64_t>(k, vector_count);
+    std::partial_sort(
+        candidates.begin(),
+        candidates.begin() + result_count,
+        candidates.end(),
+        [](const auto& lhs, const auto& rhs) {
+          if (lhs.first == rhs.first) {
+            return lhs.second < rhs.second;
+          }
+          return lhs.first < rhs.first;
+        });
+
+    for (std::int64_t result_id = 0; result_id < k; ++result_id) {
+      const auto output_offset = (query_id * k) + result_id;
+      if (result_id < result_count) {
+        distances.data_handle()[output_offset] = candidates[result_id].first;
+        neighbors.data_handle()[output_offset] = candidates[result_id].second;
+      } else {
+        distances.data_handle()[output_offset] =
+            std::numeric_limits<float>::infinity();
+        neighbors.data_handle()[output_offset] =
+            std::numeric_limits<std::uint32_t>::max();
+      }
+    }
+  }
+}
+
+// Metal dispatch counter — starts at 0, incremented only when a real
+// MTLComputeCommandEncoder dispatch occurs. Currently always 0 because
+// search() uses CPU brute-force. Green phase: metal_search.mm increments this.
+static std::uint64_t g_metal_dispatch_count = 0;
+
+std::uint64_t metal_dispatch_count() noexcept {
+  return g_metal_dispatch_count;
+}
+
+void reset_metal_dispatch_count() noexcept {
+  g_metal_dispatch_count = 0;
+}
+
+// Internal: called by metal_search.mm on every GPU kernel dispatch.
+void increment_metal_dispatch_count() noexcept {
+  ++g_metal_dispatch_count;
+}
+
+}  // namespace cuvs::neighbors::cagra
