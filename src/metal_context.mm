@@ -475,7 +475,7 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
     // cross-cluster edges. One random bucketing pass adds global diversity
     // (bridges between unrelated clusters) that nn-descent needs to converge.
     if (N > FULL_SEEDING_LIMIT) {
-        const int64_t rbsz = 2048;  // small buckets: 16MB vs 268MB per bucket
+        const int64_t rbsz = 256;  // 256×256×4=256KB bcross fits in L2 cache
         std::vector<int64_t> rperm(static_cast<size_t>(N));
         std::iota(rperm.begin(), rperm.end(), 0LL);
         uint64_t rrng = 0xFEDCBA9876543210ULL;
