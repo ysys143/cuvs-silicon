@@ -400,6 +400,60 @@ kernel void brute_force_topk(
     }
 }
 
+// Pass-2 kernel for two-pass brute-force: reads pre-computed cross[Q×N],
+// applies L2 formula, finds top-K per query. Dataset never re-read.
+// GPU reads: cross(400MB) + norms(4MB) — no large CPU transfer.
+kernel void l2_topk_from_cross(
+    device const float*  cross     [[ buffer(0) ]],  // Q×N dot products
+    device const float*  q_norms   [[ buffer(1) ]],  // Q query ||q||²
+    device const float*  d_norms   [[ buffer(2) ]],  // N dataset ||d||²
+    device uint*         out_idx   [[ buffer(3) ]],
+    device float*        out_dist  [[ buffer(4) ]],
+    constant uint&       N         [[ buffer(5) ]],
+    constant uint&       K         [[ buffer(6) ]],
+    uint q_id      [[ threadgroup_position_in_grid ]],
+    uint t_id      [[ thread_position_in_threadgroup ]],
+    uint n_threads [[ threads_per_threadgroup ]])
+{
+    const float q_norm = q_norms[q_id];
+    const device float* row = cross + (ulong)q_id * N;
+
+    const uint take = min(K, (uint)BF_MAX_K);
+    float heap_d[BF_MAX_K]; uint heap_n[BF_MAX_K];
+    for (uint k = 0; k < take; ++k) { heap_d[k] = INFINITY; heap_n[k] = 0xFFFFFFFFu; }
+
+    for (uint n = t_id; n < N; n += n_threads) {
+        float dist = q_norm - 2.f * row[n] + d_norms[n];
+        float worst = heap_d[0]; uint wi = 0u;
+        for (uint k = 1u; k < take; ++k) { if (heap_d[k] > worst) { worst = heap_d[k]; wi = k; } }
+        if (dist < worst) { heap_d[wi] = dist; heap_n[wi] = n; }
+    }
+
+    threadgroup float tg_d[BF_N_THREADS * BF_MAX_K];
+    threadgroup uint  tg_n[BF_N_THREADS * BF_MAX_K];
+    const uint off = t_id * take;
+    for (uint k = 0; k < take; ++k) { tg_d[off+k] = heap_d[k]; tg_n[off+k] = heap_n[k]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (t_id == 0) {
+        float gd[BF_MAX_K]; uint gn[BF_MAX_K];
+        for (uint k = 0; k < take; ++k) { gd[k] = INFINITY; gn[k] = 0xFFFFFFFFu; }
+        for (uint i = 0; i < n_threads * take; ++i) {
+            if (tg_n[i] == 0xFFFFFFFFu) continue;
+            float worst = gd[0]; uint wi = 0u;
+            for (uint k = 1u; k < take; ++k) { if (gd[k] > worst) { worst = gd[k]; wi = k; } }
+            if (tg_d[i] < worst) { gd[wi] = tg_d[i]; gn[wi] = tg_n[i]; }
+        }
+        for (uint i = 1; i < take; ++i) {
+            float kd = gd[i]; uint kn = gn[i]; int j = (int)i-1;
+            while (j >= 0 && gd[j] > kd) { gd[j+1] = gd[j]; gn[j+1] = gn[j]; --j; }
+            gd[j+1] = kd; gn[j+1] = kn;
+        }
+        const ulong qK = (ulong)q_id * K;
+        for (uint k = 0; k < take; ++k) { out_dist[qK+k] = gd[k]; out_idx[qK+k] = gn[k]; }
+    }
+}
+
 // P4: brute-force L2 distance — one thread per base vector.
 // Each thread computes squared Euclidean distance from base vector gid to the query.
 // dataset: N x D row-major float32

@@ -28,6 +28,7 @@ struct MetalContext::Impl {
     id<MTLComputePipelineState> pso_nn_descent         = nil;
     id<MTLComputePipelineState> pso_random_bucketing   = nil;
     id<MTLComputePipelineState> pso_brute_force_topk   = nil;
+    id<MTLComputePipelineState> pso_l2_topk_from_cross = nil;
     bool                        available = false;
     std::string                 chip_model_str;
 
@@ -76,6 +77,7 @@ MetalContext::MetalContext() : impl_(new Impl) {
         impl_->pso_nn_descent         = make_pso(@"nn_descent");
         impl_->pso_random_bucketing   = make_pso(@"random_bucketing");
         impl_->pso_brute_force_topk   = make_pso(@"brute_force_topk");
+        impl_->pso_l2_topk_from_cross = make_pso(@"l2_topk_from_cross");
 
         impl_->chip_model_str = impl_->device.name.UTF8String;
         impl_->available      = true;
@@ -137,55 +139,93 @@ uint64_t MetalContext::search_brute_force(
     if (!impl_->available)
         throw std::runtime_error("Metal device not available");
 
-    // ── Metal GPU brute-force: L2 distances + top-K entirely on GPU ──────
-    // brute_force_topk kernel: 1 threadgroup per query, 128 threads sweep N.
-    // Only Q×K results (tiny) transferred back — no Q×N intermediate buffer.
+    // ── Two-pass Metal GPU brute-force ────────────────────────────────────
+    // Pass 1 (MPS): cross[Q×N] = queries @ dataset^T  — dataset read ONCE
+    // Pass 2 (kernel): dist = q_norm - 2*cross + d_norm → top-K per query
+    // Transfer to CPU: only Q×K results (4KB). No Q×N (400MB) CPU transfer.
     @autoreleasepool {
-        // Cache dataset buffer (4GB for 1M — amortized across calls)
+        // Cache dataset + d_norms Metal buffers
         if (impl_->buf_dataset_ptr != dataset ||
             impl_->buf_dataset_N != N || impl_->buf_dataset_D != D) {
             impl_->buf_dataset_metal = make_shared_buf(impl_->device, dataset,
                 (NSUInteger)(N * D * sizeof(float)));
-            // Precompute and cache dataset norms
             impl_->cached_dataset_norms = compute_row_norms(dataset, N, D);
             impl_->buf_d_norms_metal = make_shared_buf(impl_->device,
                 impl_->cached_dataset_norms.data(),
                 (NSUInteger)(N * sizeof(float)));
             impl_->buf_dataset_ptr = dataset;
-            impl_->buf_dataset_N   = N;
-            impl_->buf_dataset_D   = D;
+            impl_->buf_dataset_N = N; impl_->buf_dataset_D = D;
             impl_->cached_dataset_ptr = dataset;
             impl_->cached_N = N; impl_->cached_D = D;
         }
 
-        auto buf_queries = make_shared_buf(impl_->device, queries,
-                               (NSUInteger)(Q * D * sizeof(float)));
-        auto buf_out_idx  = make_empty_buf(impl_->device,
-                               (NSUInteger)(Q * K * sizeof(uint32_t)));
-        auto buf_out_dist = make_empty_buf(impl_->device,
-                               (NSUInteger)(Q * K * sizeof(float)));
+        // Cache cross buffer (Q×N, GPU-only — never transferred to CPU)
+        if (impl_->buf_cross_Q != Q || impl_->buf_cross_N != N) {
+            impl_->buf_cross_metal = [impl_->device
+                newBufferWithLength:(NSUInteger)(Q * N * sizeof(float))
+                options:MTLResourceStorageModePrivate];  // GPU-only, faster
+            impl_->buf_cross_Q = Q; impl_->buf_cross_N = N;
+        }
 
-        uint32_t uN=(uint32_t)N, uD=(uint32_t)D, uK=(uint32_t)K;
-        auto cmd = [impl_->queue commandBuffer];
-        auto enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:impl_->pso_brute_force_topk];
-        [enc setBuffer:impl_->buf_dataset_metal offset:0 atIndex:0];
-        [enc setBuffer:buf_queries              offset:0 atIndex:1];
+        auto buf_queries  = make_shared_buf(impl_->device, queries,
+                                (NSUInteger)(Q * D * sizeof(float)));
+        auto buf_out_idx  = make_empty_buf(impl_->device,
+                                (NSUInteger)(Q * K * sizeof(uint32_t)));
+        auto buf_out_dist = make_empty_buf(impl_->device,
+                                (NSUInteger)(Q * K * sizeof(float)));
+
+        // Precompute query norms (tiny: Q×4 bytes)
+        const auto q_norms_vec = compute_row_norms(queries, Q, D);
+        auto buf_q_norms = make_shared_buf(impl_->device, q_norms_vec.data(),
+                               (NSUInteger)(Q * sizeof(float)));
+
+        // ── Pass 1: MPS matmul → cross (GPU-private buffer) ──────────────
+        MPSMatrixDescriptor* dQ = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:(NSUInteger)Q columns:(NSUInteger)D
+            rowBytes:(NSUInteger)(D*sizeof(float)) dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor* dD = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:(NSUInteger)N columns:(NSUInteger)D
+            rowBytes:(NSUInteger)(D*sizeof(float)) dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor* dC = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:(NSUInteger)Q columns:(NSUInteger)N
+            rowBytes:(NSUInteger)(N*sizeof(float)) dataType:MPSDataTypeFloat32];
+
+        MPSMatrix* matQ = [[MPSMatrix alloc] initWithBuffer:buf_queries           descriptor:dQ];
+        MPSMatrix* matD = [[MPSMatrix alloc] initWithBuffer:impl_->buf_dataset_metal descriptor:dD];
+        MPSMatrix* matC = [[MPSMatrix alloc] initWithBuffer:impl_->buf_cross_metal  descriptor:dC];
+
+        MPSMatrixMultiplication* gemm = [[MPSMatrixMultiplication alloc]
+            initWithDevice:impl_->device transposeLeft:NO transposeRight:YES
+            resultRows:(NSUInteger)Q resultColumns:(NSUInteger)N
+            interiorColumns:(NSUInteger)D alpha:1.0 beta:0.0];
+
+        auto cmd1 = [impl_->queue commandBuffer];
+        [gemm encodeToCommandBuffer:cmd1 leftMatrix:matQ rightMatrix:matD resultMatrix:matC];
+        [cmd1 commit];
+        [cmd1 waitUntilCompleted];
+
+        // ── Pass 2: L2 distances + top-K on GPU ───────────────────────────
+        uint32_t uN=(uint32_t)N, uK=(uint32_t)K;
+        auto cmd2 = [impl_->queue commandBuffer];
+        auto enc  = [cmd2 computeCommandEncoder];
+        [enc setComputePipelineState:impl_->pso_l2_topk_from_cross];
+        [enc setBuffer:impl_->buf_cross_metal   offset:0 atIndex:0];
+        [enc setBuffer:buf_q_norms              offset:0 atIndex:1];
         [enc setBuffer:impl_->buf_d_norms_metal offset:0 atIndex:2];
         [enc setBuffer:buf_out_idx              offset:0 atIndex:3];
         [enc setBuffer:buf_out_dist             offset:0 atIndex:4];
         [enc setBytes:&uN length:4 atIndex:5];
-        [enc setBytes:&uD length:4 atIndex:6];
-        [enc setBytes:&uK length:4 atIndex:7];
+        [enc setBytes:&uK length:4 atIndex:6];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)Q, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        [cmd2 commit];
+        [cmd2 waitUntilCompleted];
 
-        if (cmd.error)
-            throw std::runtime_error(cmd.error.localizedDescription.UTF8String);
+        if (cmd2.error)
+            throw std::runtime_error(cmd2.error.localizedDescription.UTF8String);
 
+        // Only Q×K = 4KB transferred to CPU
         std::copy_n((const uint32_t*)buf_out_idx.contents,
                     static_cast<size_t>(Q * K), out_neighbors);
         std::copy_n((const float*)buf_out_dist.contents,
