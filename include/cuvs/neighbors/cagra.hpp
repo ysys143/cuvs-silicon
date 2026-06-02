@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <utility>
 #include <type_traits>
 #include <vector>
@@ -103,6 +104,13 @@ void search(const raft::resources& resources,
             raft::device_matrix_view<const DataT, ExtentT> queries,
             raft::device_matrix_view<IndexT, ExtentT> neighbors,
             raft::device_matrix_view<float, ExtentT> distances);
+
+// Index serialization — save/load a built CAGRA index to/from a binary file.
+// Format: magic("CGRA") + version(1) + N + D + G + flags + knn_graph
+//         [+ dataset if stored] [+ nav_nodes + nav_vectors if present]
+void save_index(const index<float, std::uint32_t>& idx,
+                const std::string& path);
+index<float, std::uint32_t> load_index(const std::string& path);
 
 // Metal dispatch instrumentation — test hook.
 // metal_dispatch_count() returns how many times a Metal GPU kernel was

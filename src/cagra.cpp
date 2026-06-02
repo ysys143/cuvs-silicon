@@ -1,8 +1,10 @@
 #include <cstdint>
 #include <algorithm>
+#include <fstream>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -261,6 +263,106 @@ std::uint64_t metal_dispatch_count() noexcept {
 
 void reset_metal_dispatch_count() noexcept {
   g_metal_dispatch_count = 0;
+}
+
+// ── Index serialization ────────────────────────────────────────────────────
+// Binary format (little-endian):
+//   [4]  magic "CGRA"
+//   [4]  version = 1
+//   [8]  N (rows), [8] D (cols), [4] G (graph_degree)
+//   [4]  flags: bit0=has_dataset, bit1=has_nav
+//   [N×G×4]  knn_graph (uint32)
+//   if has_dataset: [N×D×4]  dataset (float32)
+//   if has_nav: [4] n_nav, [n_nav×4] nav_nodes, [n_nav×D×4] nav_vectors
+
+static void write_vec_u32(std::ofstream& f, const std::vector<std::uint32_t>& v) {
+    f.write(reinterpret_cast<const char*>(v.data()),
+            static_cast<std::streamsize>(v.size() * sizeof(std::uint32_t)));
+}
+static void write_vec_f32(std::ofstream& f, const std::vector<float>& v) {
+    f.write(reinterpret_cast<const char*>(v.data()),
+            static_cast<std::streamsize>(v.size() * sizeof(float)));
+}
+template<typename T>
+static void write_val(std::ofstream& f, T v) {
+    f.write(reinterpret_cast<const char*>(&v), sizeof(T));
+}
+template<typename T>
+static T read_val(std::ifstream& f) {
+    T v; f.read(reinterpret_cast<char*>(&v), sizeof(T)); return v;
+}
+static void read_vec_u32(std::ifstream& f, std::vector<std::uint32_t>& v, std::size_t n) {
+    v.resize(n);
+    f.read(reinterpret_cast<char*>(v.data()),
+           static_cast<std::streamsize>(n * sizeof(std::uint32_t)));
+}
+static void read_vec_f32(std::ifstream& f, std::vector<float>& v, std::size_t n) {
+    v.resize(n);
+    f.read(reinterpret_cast<char*>(v.data()),
+           static_cast<std::streamsize>(n * sizeof(float)));
+}
+
+void save_index(const index<float, std::uint32_t>& idx, const std::string& path) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("save_index: cannot open " + path);
+
+    f.write("CGRA", 4);
+    write_val<std::uint32_t>(f, 1u);  // version
+    write_val<std::int64_t>(f, idx.rows());
+    write_val<std::int64_t>(f, idx.cols());
+    write_val<std::uint32_t>(f, idx.graph_degree());
+
+    const bool has_dataset = !idx.dataset().empty();
+    const bool has_nav     = !idx.nav_nodes().empty();
+    write_val<std::uint32_t>(f,
+        (has_dataset ? 0x1u : 0u) | (has_nav ? 0x2u : 0u));
+
+    write_vec_u32(f, idx.knn_graph());
+    if (has_dataset) write_vec_f32(f, idx.dataset());
+    if (has_nav) {
+        write_val<std::uint32_t>(f, static_cast<std::uint32_t>(idx.nav_nodes().size()));
+        write_vec_u32(f, idx.nav_nodes());
+        write_vec_f32(f, idx.nav_vectors());
+    }
+    if (!f) throw std::runtime_error("save_index: write failed");
+}
+
+index<float, std::uint32_t> load_index(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("load_index: cannot open " + path);
+
+    char magic[4]; f.read(magic, 4);
+    if (std::string(magic, 4) != "CGRA")
+        throw std::runtime_error("load_index: invalid magic");
+    const auto ver = read_val<std::uint32_t>(f);
+    if (ver != 1) throw std::runtime_error("load_index: unsupported version");
+
+    const auto N     = read_val<std::int64_t>(f);
+    const auto D     = read_val<std::int64_t>(f);
+    const auto G     = read_val<std::uint32_t>(f);
+    const auto flags = read_val<std::uint32_t>(f);
+    const bool has_dataset = (flags & 0x1u) != 0;
+    const bool has_nav     = (flags & 0x2u) != 0;
+
+    std::vector<float> dataset;
+    if (has_dataset) read_vec_f32(f, dataset, static_cast<std::size_t>(N * D));
+
+    index<float, std::uint32_t> idx(std::move(dataset), N, D);
+
+    std::vector<std::uint32_t> knn;
+    read_vec_u32(f, knn, static_cast<std::size_t>(N) * G);
+    idx.set_knn_graph(std::move(knn), G);
+
+    if (has_nav) {
+        const auto n_nav = read_val<std::uint32_t>(f);
+        std::vector<std::uint32_t> nav_n; read_vec_u32(f, nav_n, n_nav);
+        std::vector<float>         nav_v; read_vec_f32(f, nav_v,
+            static_cast<std::size_t>(n_nav) * static_cast<std::size_t>(D));
+        idx.set_nav_nodes(std::move(nav_n));
+        idx.set_nav_vectors(std::move(nav_v));
+    }
+    if (!f) throw std::runtime_error("load_index: read failed");
+    return idx;
 }
 
 // Internal: called by metal_search.mm on every GPU kernel dispatch.
