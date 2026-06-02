@@ -465,7 +465,7 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
     // IVF seeding produces locally well-connected clusters but lacks
     // cross-cluster edges. One random bucketing pass adds global diversity
     // (bridges between unrelated clusters) that nn-descent needs to converge.
-    if (N > FULL_SEEDING_LIMIT) {
+    if (false && N > FULL_SEEDING_LIMIT) {  // disabled: IVF+nn-descent sufficient
         const int64_t rbsz = 256;  // 256×256×4=256KB bcross fits in L2 cache
         std::vector<int64_t> rperm(static_cast<size_t>(N));
         std::iota(rperm.begin(), rperm.end(), 0LL);
