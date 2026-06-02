@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <functional>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -89,38 +90,54 @@ static BenchResult run_metal_bench(
         const int32_t* gt,
         int64_t K,
         int warmup_iters, int measure_iters,
-        uint32_t graph_degree = 64) {
+        uint32_t graph_degree = 64,
+        const std::string& save_path = "",
+        const std::string& load_path = "") {
 
-    // Build CAGRA index (graph_degree=0 → AMX brute-force, no graph build)
     raft::resources res;
     cuvs::neighbors::cagra::index_params ip;
     ip.graph_degree = graph_degree;
 
-    std::printf("  %s...\n", graph_degree == 0
-        ? "Building index (AMX brute-force, no graph)"
-        : "Building CAGRA graph (GPU)");
-    fflush(stdout);
-    std::atomic<bool> build_done{false};
-    std::thread watchdog([&build_done]() {
-        for (int i = 0; i < 900; ++i) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            if (build_done.load()) return;
-        }
-        std::fprintf(stderr, "\n[TIMEOUT] Build exceeded 900s. Aborting.\n");
-        _exit(1);
-    });
     const auto t_build0 = Clock::now();
-    auto idx = cuvs::neighbors::cagra::build(
-        res, ip,
-        raft::device_matrix_view<const float, std::int64_t>(base, N, D));
-    build_done.store(true);
-    watchdog.join();
+    cuvs::neighbors::cagra::index<float, std::uint32_t> idx = [&]() {
+        if (!load_path.empty()) {
+            std::printf("  Loading index from %s ...\n", load_path.c_str());
+            fflush(stdout);
+            return cuvs::neighbors::cagra::load_index(load_path);
+        }
+        std::printf("  %s...\n", graph_degree == 0
+            ? "Building index (AMX brute-force, no graph)"
+            : "Building CAGRA graph (GPU)");
+        fflush(stdout);
+        std::atomic<bool> build_done{false};
+        std::thread watchdog([&build_done]() {
+            for (int i = 0; i < 900; ++i) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (build_done.load()) return;
+            }
+            std::fprintf(stderr, "\n[TIMEOUT] Build exceeded 900s. Aborting.\n");
+            _exit(1);
+        });
+        auto result = cuvs::neighbors::cagra::build(
+            res, ip,
+            raft::device_matrix_view<const float, std::int64_t>(base, N, D));
+        build_done.store(true);
+        watchdog.join();
+        return result;
+    }();
     const double build_ms =
         std::chrono::duration<double, std::milli>(Clock::now() - t_build0).count();
-    std::printf("  Build time: %.2fs  graph_degree=%u  has_graph=%s\n",
+    std::printf("  %s time: %.2fs  graph_degree=%u  has_graph=%s\n",
+                load_path.empty() ? "Build" : "Load",
                 build_ms / 1000.0,
                 idx.graph_degree(),
                 idx.graph_degree() > 0 ? "yes" : "no");
+
+    if (!save_path.empty()) {
+        std::printf("  Saving index to %s ...\n", save_path.c_str()); fflush(stdout);
+        cuvs::neighbors::cagra::save_index(idx, save_path);
+        std::printf("  Saved.\n"); fflush(stdout);
+    }
 
     cuvs::neighbors::cagra::search_params sp;
     sp.itopk_size     = 512;
@@ -251,6 +268,8 @@ int main(int argc, char* argv[]) {
     const int      warmup_iter  = argc > 5 ? std::stoi(argv[5]) : 3;
     const int      measure_iter = argc > 6 ? std::stoi(argv[6]) : 10;
     const uint32_t graph_degree = argc > 7 ? static_cast<uint32_t>(std::stoul(argv[7])) : 64;
+    const std::string save_path = argc > 8 ? argv[8] : "";  // save index after build
+    const std::string load_path = argc > 9 ? argv[9] : "";  // skip build, load from file
 
     int32_t base_rows, base_cols, q_rows, q_cols, gt_rows, gt_cols;
     const auto base    = load_bin<float>  (base_path,    base_rows, base_cols);
@@ -277,7 +296,8 @@ int main(int argc, char* argv[]) {
                                      queries.data(), Q,
                                      gt.data(), K,
                                      warmup_iter, measure_iter,
-                                     graph_degree);
+                                     graph_degree,
+                                     save_path, load_path);
         std::printf("  recall@%lld = %.4f\n",  (long long)K, metal_res.recall_at_k);
         std::printf("  QPS        = %.1f\n",  metal_res.qps);
         std::printf("  p50 ms     = %.2f\n",  metal_res.p50_ms);
