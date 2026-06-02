@@ -213,117 +213,238 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
     if (!impl_->available)
         throw std::runtime_error("Metal device not available");
 
-    // For small N, use full N×N seeding for exact graph quality.
-    // For large N, use multi-pass bucketing (3 passes with different permutations).
-    constexpr int64_t FULL_SEEDING_LIMIT = 50000;
-    const int64_t bsz = (N <= FULL_SEEDING_LIMIT)
-        ? N
-        : std::min(bucket_size_hint,
-                   std::max((int64_t)G * 32, (int64_t)8192));
-    const int n_seed_passes = (N <= FULL_SEEDING_LIMIT) ? 1 : 3;
+    // ── Phase 1: Seeding ──────────────────────────────────────────────────
+    // Small N: exact N×N seeding via cblas_sgemm.
+    // Large N: IVF K-means seeding — K=sqrt(N) clusters, probe own + n_probe
+    //          nearest clusters → high-quality graph without N² cost.
 
-    // ── Phase 1: Random-bucket seeding ────────────────────────────────
-    // Shuffle vector indices, process in buckets of ~bsz.
-    // For each bucket compute exact k-NN via MPS matmul.
+    constexpr int64_t FULL_SEEDING_LIMIT = 50000;
 
     std::vector<uint32_t> graph(static_cast<size_t>(N) * G,
                                  std::numeric_limits<uint32_t>::max());
     std::vector<float> graph_dist(static_cast<size_t>(N) * G,
                                    std::numeric_limits<float>::infinity());
 
-    // Row norms (needed for L2 from dot-product)
     std::vector<float> norms(static_cast<size_t>(N));
     for (int64_t i = 0; i < N; ++i) {
-        float s = 0.f;
-        const float* v = dataset + i * D;
+        float s = 0.f; const float* v = dataset + i * D;
         for (int64_t d = 0; d < D; ++d) s += v[d] * v[d];
         norms[static_cast<size_t>(i)] = s;
     }
 
-    // Multi-pass seeding: each pass uses a different random permutation.
-    // Passes > 1 are used for large N to increase graph coverage.
-    std::vector<int64_t> perm(static_cast<size_t>(N));
-    for (int pass = 0; pass < n_seed_passes; ++pass) {
-    std::iota(perm.begin(), perm.end(), 0LL);
-    uint64_t rng = 0x123456789ABCDEFULL + static_cast<uint64_t>(pass) * 0xDEADBEEFCAFEULL;
-    for (int64_t i = N - 1; i > 0; --i) {
-        rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
-        int64_t j = (int64_t)(rng >> 33) % (i + 1);
-        std::swap(perm[static_cast<size_t>(i)], perm[static_cast<size_t>(j)]);
-    }
+    auto insert_neighbor = [&](int64_t vi, uint32_t nbr, float dist) {
+        const size_t row = static_cast<size_t>(vi) * G;
+        float worst = graph_dist[row]; uint32_t worst_g = 0;
+        for (uint32_t g = 1; g < G; ++g) {
+            if (graph_dist[row+g] > worst) { worst = graph_dist[row+g]; worst_g = g; }
+        }
+        if (dist < worst) { graph[row+worst_g] = nbr; graph_dist[row+worst_g] = dist; }
+    };
 
-    // Process buckets for this pass
-    @autoreleasepool {
-        for (int64_t start = 0; start < N; start += bsz) {
-            const int64_t end = std::min(start + bsz, N);
-            const int64_t Bs  = end - start;
-
-            // Gather bucket vectors
-            std::vector<float> bucket_data(static_cast<size_t>(Bs * D));
-            for (int64_t b = 0; b < Bs; ++b) {
-                const int64_t idx = perm[static_cast<size_t>(start + b)];
-                std::copy_n(dataset + idx * D,
-                            static_cast<size_t>(D),
-                            bucket_data.data() + b * D);
+    if (N <= FULL_SEEDING_LIMIT) {
+        // Exact N×N seeding via cblas_sgemm (AMX)
+        std::vector<float> cross(static_cast<size_t>(N * N));
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    (int)N, (int)N, (int)D,
+                    1.0f, dataset, (int)D, dataset, (int)D,
+                    0.0f, cross.data(), (int)N);
+        std::vector<uint32_t> idx_buf(static_cast<size_t>(N));
+        for (int64_t i = 0; i < N; ++i) {
+            const float ni = norms[static_cast<size_t>(i)];
+            std::iota(idx_buf.begin(), idx_buf.end(), 0u);
+            idx_buf[static_cast<size_t>(i)] = idx_buf[static_cast<size_t>(N-1)];
+            const int64_t take = std::min((int64_t)G, N-1);
+            std::partial_sort(idx_buf.begin(), idx_buf.begin()+take,
+                              idx_buf.begin()+N-1,
+                [&](uint32_t a, uint32_t b) {
+                    float da = ni - 2.f*cross[i*N+a] + norms[a];
+                    float db = ni - 2.f*cross[i*N+b] + norms[b];
+                    return da < db;
+                });
+            for (int64_t k = 0; k < take; ++k) {
+                uint32_t nbr = idx_buf[static_cast<size_t>(k)];
+                float d = ni - 2.f*cross[i*N+nbr] + norms[nbr];
+                insert_neighbor(i, nbr, d);
             }
+        }
 
-            // MPS matmul: cross[Bs×Bs] = bucket[Bs×D] @ bucket^T
-            std::vector<float> cross(static_cast<size_t>(Bs * Bs));
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        (int)Bs, (int)Bs, (int)D,
-                        1.0f, bucket_data.data(), (int)D,
-                        bucket_data.data(), (int)D,
-                        0.0f, cross.data(), (int)Bs);
+    } else {
+        // IVF K-means seeding for large N
+        const int64_t K = std::min<int64_t>(
+            std::max<int64_t>(static_cast<int64_t>(std::sqrt(static_cast<double>(N))), G+1),
+            2000LL);
+        constexpr int km_iters = 20;
+        constexpr int n_probe  = 3;   // probe own + 3 nearest clusters
+        constexpr int64_t chunk = 4096; // chunk size for E-step to limit memory
 
-            // For each vector in bucket, find top-G neighbors
-            std::vector<uint32_t> idx_buf(static_cast<size_t>(Bs));
-            for (int64_t b = 0; b < Bs; ++b) {
-                const int64_t vi = perm[static_cast<size_t>(start + b)];
-                const float ni  = norms[static_cast<size_t>(vi)];
-                const float* cr = cross.data() + b * Bs;
+        // ── K-means initialization: uniform sampling ──────────────────
+        std::vector<float> centroids(static_cast<size_t>(K * D));
+        {
+            uint64_t rng = 0x123456789ABCDEFULL;
+            for (int64_t k = 0; k < K; ++k) {
+                rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+                int64_t idx = static_cast<int64_t>(rng >> 33) % N;
+                std::copy_n(dataset + idx*D, static_cast<size_t>(D),
+                            centroids.data() + k*D);
+            }
+        }
 
-                std::iota(idx_buf.begin(), idx_buf.end(), 0u);
-                idx_buf[static_cast<size_t>(b)] =
-                    idx_buf[static_cast<size_t>(Bs - 1)];
-                const int64_t valid = Bs - 1;
-                const int64_t take  = std::min((int64_t)G, valid);
+        std::vector<uint32_t> assignments(static_cast<size_t>(N), 0u);
+        std::vector<float> c_norms(static_cast<size_t>(K));
+        std::vector<float> cross_ck(static_cast<size_t>(chunk * K));
 
-                std::partial_sort(idx_buf.begin(),
-                                  idx_buf.begin() + take,
-                                  idx_buf.begin() + valid,
-                    [&](uint32_t a, uint32_t b_idx) {
-                        const int64_t ga = perm[static_cast<size_t>(start + a)];
-                        const int64_t gb = perm[static_cast<size_t>(start + b_idx)];
-                        float da = ni - 2.f * cr[a] + norms[static_cast<size_t>(ga)];
-                        float db = ni - 2.f * cr[b_idx] + norms[static_cast<size_t>(gb)];
-                        return da < db;
-                    });
-
-                const size_t row = static_cast<size_t>(vi) * G;
-                for (int64_t k = 0; k < take; ++k) {
-                    const int64_t nbr_idx = perm[static_cast<size_t>(
-                        start + idx_buf[static_cast<size_t>(k)])];
-                    const float nb_ni = norms[static_cast<size_t>(nbr_idx)];
-                    const float dist  = ni - 2.f * cr[idx_buf[static_cast<size_t>(k)]]
-                                        + nb_ni;
-                    // Insert if better than current worst
-                    float worst = graph_dist[row];
-                    uint32_t worst_g = 0;
-                    for (uint32_t g = 1; g < G; ++g) {
-                        if (graph_dist[row + g] > worst) {
-                            worst   = graph_dist[row + g];
-                            worst_g = g;
-                        }
+        for (int iter = 0; iter < km_iters; ++iter) {
+            // centroid norms
+            for (int64_t k = 0; k < K; ++k) {
+                float s = 0.f; const float* c = centroids.data() + k*D;
+                for (int64_t d = 0; d < D; ++d) s += c[d]*c[d];
+                c_norms[static_cast<size_t>(k)] = s;
+            }
+            // E-step: chunked cblas_sgemm → argmin
+            bool changed = (iter == 0);
+            for (int64_t start = 0; start < N; start += chunk) {
+                const int64_t Bs = std::min(chunk, N - start);
+                if (static_cast<int64_t>(cross_ck.size()) < Bs * K)
+                    cross_ck.resize(static_cast<size_t>(Bs * K));
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            (int)Bs, (int)K, (int)D,
+                            1.0f, dataset + start*D, (int)D,
+                            centroids.data(), (int)D,
+                            0.0f, cross_ck.data(), (int)K);
+                for (int64_t b = 0; b < Bs; ++b) {
+                    const int64_t vi = start + b;
+                    const float ni = norms[static_cast<size_t>(vi)];
+                    float best_d = std::numeric_limits<float>::infinity();
+                    uint32_t best_k = 0;
+                    for (int64_t k = 0; k < K; ++k) {
+                        float d = ni - 2.f*cross_ck[b*K+k] + c_norms[static_cast<size_t>(k)];
+                        if (d < best_d) { best_d = d; best_k = static_cast<uint32_t>(k); }
                     }
-                    if (dist < worst) {
-                        graph[row + worst_g]      = static_cast<uint32_t>(nbr_idx);
-                        graph_dist[row + worst_g] = dist;
+                    if (assignments[static_cast<size_t>(vi)] != best_k) {
+                        changed = true; assignments[static_cast<size_t>(vi)] = best_k;
                     }
                 }
             }
+            if (!changed) break;
+            // M-step: update centroids
+            std::fill(centroids.begin(), centroids.end(), 0.f);
+            std::vector<int64_t> counts(static_cast<size_t>(K), 0LL);
+            for (int64_t i = 0; i < N; ++i) {
+                const uint32_t k = assignments[static_cast<size_t>(i)];
+                counts[static_cast<size_t>(k)]++;
+                cblas_saxpy((int)D, 1.0f, dataset + i*D, 1,
+                            centroids.data() + k*D, 1);
+            }
+            for (int64_t k = 0; k < K; ++k) {
+                if (counts[static_cast<size_t>(k)] > 0)
+                    cblas_sscal((int)D, 1.0f/counts[static_cast<size_t>(k)],
+                                centroids.data() + k*D, 1);
+            }
         }
-    }
-    } // end pass loop
+
+        // ── Build cluster membership lists ─────────────────────────────
+        std::vector<std::vector<uint32_t>> clusters(static_cast<size_t>(K));
+        for (int64_t i = 0; i < N; ++i)
+            clusters[assignments[static_cast<size_t>(i)]].push_back(
+                static_cast<uint32_t>(i));
+
+        // ── Find n_probe nearest clusters for each cluster (centroid dist) ──
+        // centroid-centroid cross[K×K]
+        std::vector<float> cc_cross(static_cast<size_t>(K * K));
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    (int)K, (int)K, (int)D,
+                    1.0f, centroids.data(), (int)D, centroids.data(), (int)D,
+                    0.0f, cc_cross.data(), (int)K);
+        // reuse c_norms already computed above
+        for (int64_t k = 0; k < K; ++k) {
+            float s = 0.f; const float* c = centroids.data() + k*D;
+            for (int64_t d = 0; d < D; ++d) s += c[d]*c[d];
+            c_norms[static_cast<size_t>(k)] = s;
+        }
+        std::vector<std::vector<uint32_t>> near_clusters(static_cast<size_t>(K));
+        {
+            std::vector<uint32_t> kidx(static_cast<size_t>(K));
+            for (int64_t k = 0; k < K; ++k) {
+                std::iota(kidx.begin(), kidx.end(), 0u);
+                kidx[static_cast<size_t>(k)] = kidx[static_cast<size_t>(K-1)];
+                const int64_t take = std::min((int64_t)n_probe, K-1);
+                const float ck = c_norms[static_cast<size_t>(k)];
+                std::partial_sort(kidx.begin(), kidx.begin()+take, kidx.begin()+K-1,
+                    [&](uint32_t a, uint32_t b) {
+                        float da = ck - 2.f*cc_cross[k*K+a] + c_norms[a];
+                        float db = ck - 2.f*cc_cross[k*K+b] + c_norms[b];
+                        return da < db;
+                    });
+                near_clusters[static_cast<size_t>(k)].assign(
+                    kidx.begin(), kidx.begin()+take);
+            }
+        }
+
+        // ── For each cluster, probe own + near clusters, compute k-NN ──
+        for (int64_t k = 0; k < K; ++k) {
+            const auto& own = clusters[static_cast<size_t>(k)];
+            if (own.empty()) continue;
+
+            // Gather probe set: own + near clusters
+            std::vector<uint32_t> probe;
+            probe.insert(probe.end(), own.begin(), own.end());
+            for (auto nk : near_clusters[static_cast<size_t>(k)])
+                for (auto v : clusters[static_cast<size_t>(nk)])
+                    probe.push_back(v);
+            const int64_t M  = static_cast<int64_t>(probe.size());
+            const int64_t nk = static_cast<int64_t>(own.size());
+            if (M <= 1) continue;
+
+            // Gather probe vectors and own vectors
+            std::vector<float> probe_vecs(static_cast<size_t>(M * D));
+            std::vector<float> probe_norms(static_cast<size_t>(M));
+            for (int64_t m = 0; m < M; ++m) {
+                std::copy_n(dataset + probe[static_cast<size_t>(m)]*D,
+                            static_cast<size_t>(D),
+                            probe_vecs.data() + m*D);
+                probe_norms[static_cast<size_t>(m)] =
+                    norms[static_cast<size_t>(probe[static_cast<size_t>(m)])];
+            }
+            std::vector<float> own_vecs(static_cast<size_t>(nk * D));
+            for (int64_t i = 0; i < nk; ++i)
+                std::copy_n(dataset + own[static_cast<size_t>(i)]*D,
+                            static_cast<size_t>(D),
+                            own_vecs.data() + i*D);
+
+            // cross[nk×M] = own_vecs[nk×D] @ probe_vecs[M×D]^T
+            std::vector<float> cross_nm(static_cast<size_t>(nk * M));
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        (int)nk, (int)M, (int)D,
+                        1.0f, own_vecs.data(), (int)D,
+                        probe_vecs.data(), (int)D,
+                        0.0f, cross_nm.data(), (int)M);
+
+            // For each own vector: find top-G from probe set
+            std::vector<uint32_t> midx(static_cast<size_t>(M));
+            for (int64_t i = 0; i < nk; ++i) {
+                const uint32_t vi = own[static_cast<size_t>(i)];
+                const float ni    = norms[static_cast<size_t>(vi)];
+                const float* cr   = cross_nm.data() + i*M;
+                std::iota(midx.begin(), midx.end(), 0u);
+                const int64_t take = std::min((int64_t)G, M-1);
+                std::partial_sort(midx.begin(), midx.begin()+take, midx.end(),
+                    [&](uint32_t a, uint32_t b) {
+                        if (probe[static_cast<size_t>(a)] == vi) return false;
+                        if (probe[static_cast<size_t>(b)] == vi) return true;
+                        float da = ni - 2.f*cr[a] + probe_norms[a];
+                        float db = ni - 2.f*cr[b] + probe_norms[b];
+                        return da < db;
+                    });
+                for (int64_t t = 0; t < take; ++t) {
+                    uint32_t m_idx = midx[static_cast<size_t>(t)];
+                    uint32_t nbr   = probe[static_cast<size_t>(m_idx)];
+                    if (nbr == vi) continue;
+                    float d = ni - 2.f*cr[m_idx] + probe_norms[static_cast<size_t>(m_idx)];
+                    insert_neighbor(vi, nbr, d);
+                }
+            }
+        }
+    } // end IVF seeding
 
     // ── Phase 2: nn-descent refinement via Metal kernel ───────────────
     if (impl_->pso_nn_descent && n_descent_iters > 0) {
