@@ -298,7 +298,10 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
         std::vector<float> c_norms(static_cast<size_t>(K));
         std::vector<float> cross_ck(static_cast<size_t>(chunk * K));
 
+        fprintf(stderr, "  [build] K-means K=%lld  ", (long long)K);
+        fflush(stderr);
         for (int iter = 0; iter < km_iters; ++iter) {
+            fprintf(stderr, "%d ", iter+1); fflush(stderr);
             // centroid norms
             for (int64_t k = 0; k < K; ++k) {
                 float s = 0.f; const float* c = centroids.data() + k*D;
@@ -347,6 +350,9 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
             }
         }
 
+        fprintf(stderr, "\n  [build] IVF seeding K=%lld  0%%", (long long)K);
+        fflush(stderr);
+
         // ── Build cluster membership lists ─────────────────────────────
         std::vector<std::vector<uint32_t>> clusters(static_cast<size_t>(K));
         for (int64_t i = 0; i < N; ++i)
@@ -392,6 +398,11 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
         const int64_t max_own = (N / K) * 4 + 64;
 
         for (int64_t k = 0; k < K; ++k) {
+            if (k % (K / 10 + 1) == 0) {
+                fprintf(stderr, "\r  [build] IVF seeding  %3lld%%",
+                        (long long)(k * 100 / K));
+                fflush(stderr);
+            }
             const auto& own_full = clusters[static_cast<size_t>(k)];
             if (own_full.empty()) continue;
 
@@ -477,6 +488,7 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
             }
         }
     } // end IVF seeding
+    fprintf(stderr, "\r  [build] IVF seeding  100%%\n"); fflush(stderr);
 
     // ── Phase 1b: Random bucketing pass (GPU-accelerated) ─────────────────
     // IVF seeding lacks cross-cluster edges. One random bucketing pass adds
@@ -557,7 +569,9 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
             // set. Races on graph[] writes are benign (worst: miss one update).
             const NSUInteger threads = std::min(G, 32u);
 
+            fprintf(stderr, "  [build] nn-descent  "); fflush(stderr);
             for (uint32_t iter = 0; iter < n_descent_iters; ++iter) {
+                fprintf(stderr, "%u/%u ", iter+1, n_descent_iters); fflush(stderr);
                 memset(buf_improved.contents, 0,
                        static_cast<size_t>(N * sizeof(uint32_t)));
 
@@ -585,6 +599,8 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
                     if (imp[static_cast<size_t>(i)]) { changed = true; break; }
                 if (!changed) break;
             }
+
+            fprintf(stderr, "\n"); fflush(stderr);
 
             // Read back refined graph
             std::copy_n(static_cast<const uint32_t*>(buf_graph.contents),
