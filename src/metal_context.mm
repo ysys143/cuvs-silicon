@@ -416,7 +416,7 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
             const int64_t M = static_cast<int64_t>(probe.size());
             if (M <= 1) continue;
 
-            // Gather probe vectors and compute distances
+            // Gather probe vectors (once per cluster)
             std::vector<float> probe_vecs(static_cast<size_t>(M * D));
             std::vector<float> probe_norms(static_cast<size_t>(M));
             for (int64_t m = 0; m < M; ++m) {
@@ -425,39 +425,54 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
                             probe_vecs.data() + m*D);
                 probe_norms[static_cast<size_t>(m)] = norms[static_cast<size_t>(pv)];
             }
-            std::vector<float> own_vecs(static_cast<size_t>(nk * D));
-            for (int64_t i = 0; i < nk; ++i)
-                std::copy_n(dataset + own_full[static_cast<size_t>(i)]*D,
-                            static_cast<size_t>(D), own_vecs.data() + i*D);
 
-            // cross[nk×M] = own_vecs @ probe_vecs^T  (AMX)
-            std::vector<float> cross_nm(static_cast<size_t>(nk * M));
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        (int)nk, (int)M, (int)D,
-                        1.0f, own_vecs.data(), (int)D,
-                        probe_vecs.data(), (int)D,
-                        0.0f, cross_nm.data(), (int)M);
-
+            // Batch own vectors to bound cross_batch size.
+            // cross[batch×M] = own_batch[batch×D] @ probe_vecs[M×D]^T
+            // Without batching: cross_nm = nk×M can be 114MB for N=1M → OOM/slow.
+            constexpr int64_t MAX_BATCH = 256;
+            const int64_t n_batches = (nk + MAX_BATCH - 1) / MAX_BATCH;
+            std::vector<float> batch_vecs(static_cast<size_t>(
+                std::min(nk, MAX_BATCH) * D));
+            std::vector<float> cross_batch(static_cast<size_t>(
+                std::min(nk, MAX_BATCH) * M));
             std::vector<uint32_t> midx(static_cast<size_t>(M));
-            for (int64_t i = 0; i < nk; ++i) {
-                const uint32_t vi = own_full[static_cast<size_t>(i)];
-                const float ni = norms[static_cast<size_t>(vi)];
-                const float* cr = cross_nm.data() + i*M;
-                std::iota(midx.begin(), midx.end(), 0u);
+            (void)n_batches;
+
+            for (int64_t istart = 0; istart < nk; istart += MAX_BATCH) {
+                const int64_t iend = std::min(istart + MAX_BATCH, nk);
+                const int64_t ibsz = iend - istart;
+
+                for (int64_t ii = 0; ii < ibsz; ++ii)
+                    std::copy_n(dataset + own_full[static_cast<size_t>(istart+ii)]*D,
+                                static_cast<size_t>(D),
+                                batch_vecs.data() + ii*D);
+
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            (int)ibsz, (int)M, (int)D,
+                            1.0f, batch_vecs.data(), (int)D,
+                            probe_vecs.data(), (int)D,
+                            0.0f, cross_batch.data(), (int)M);
+
                 const int64_t take = std::min((int64_t)G, M-1);
-                std::partial_sort(midx.begin(), midx.begin()+take, midx.end(),
-                    [&](uint32_t a, uint32_t b) {
-                        if (probe[a] == vi) return false;
-                        if (probe[b] == vi) return true;
-                        return ni-2.f*cr[a]+probe_norms[a] <
-                               ni-2.f*cr[b]+probe_norms[b];
-                    });
-                for (int64_t t = 0; t < take; ++t) {
-                    uint32_t nbr = probe[midx[static_cast<size_t>(t)]];
-                    if (nbr == vi) continue;
-                    float d = ni - 2.f*cr[midx[static_cast<size_t>(t)]]
-                              + probe_norms[midx[static_cast<size_t>(t)]];
-                    insert_neighbor(vi, nbr, d);
+                for (int64_t i = istart; i < iend; ++i) {
+                    const uint32_t vi = own_full[static_cast<size_t>(i)];
+                    const float ni = norms[static_cast<size_t>(vi)];
+                    const float* cr = cross_batch.data() + (i-istart)*M;
+                    std::iota(midx.begin(), midx.end(), 0u);
+                    std::partial_sort(midx.begin(), midx.begin()+take, midx.end(),
+                        [&](uint32_t a, uint32_t b) {
+                            if (probe[a] == vi) return false;
+                            if (probe[b] == vi) return true;
+                            return ni-2.f*cr[a]+probe_norms[a] <
+                                   ni-2.f*cr[b]+probe_norms[b];
+                        });
+                    for (int64_t t = 0; t < take; ++t) {
+                        uint32_t nbr = probe[midx[static_cast<size_t>(t)]];
+                        if (nbr == vi) continue;
+                        float d = ni - 2.f*cr[midx[static_cast<size_t>(t)]]
+                                  + probe_norms[midx[static_cast<size_t>(t)]];
+                        insert_neighbor(vi, nbr, d);
+                    }
                 }
             }
         }
