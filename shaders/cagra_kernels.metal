@@ -333,6 +333,73 @@ kernel void random_bucketing(
     }
 }
 
+// Brute-force top-K search: one threadgroup per query.
+// Threads sweep all N database vectors in parallel, each maintaining a
+// thread-local top-K heap. Merge via threadgroup shared memory.
+// Only Q×K results leave GPU — no large intermediate transfer to CPU.
+#define BF_MAX_K     16   // max supported K (handles K=10)
+#define BF_N_THREADS 128  // threads per threadgroup (must match dispatch)
+kernel void brute_force_topk(
+    device const float*  dataset   [[ buffer(0) ]],  // N×D
+    device const float*  queries   [[ buffer(1) ]],  // Q×D
+    device const float*  d_norms   [[ buffer(2) ]],  // N ||d||²
+    device uint*         out_idx   [[ buffer(3) ]],  // Q×K
+    device float*        out_dist  [[ buffer(4) ]],  // Q×K
+    constant uint&       N         [[ buffer(5) ]],
+    constant uint&       D         [[ buffer(6) ]],
+    constant uint&       K         [[ buffer(7) ]],
+    uint q_id      [[ threadgroup_position_in_grid ]],
+    uint t_id      [[ thread_position_in_threadgroup ]],
+    uint n_threads [[ threads_per_threadgroup ]])
+{
+    const uint D4 = D >> 2u;
+    const device float4* qv = (const device float4*)(queries + (ulong)q_id * D);
+
+    float q_norm = 0.f;
+    for (uint d = 0; d < D4; ++d) { float4 v = qv[d]; q_norm += dot(v, v); }
+
+    const uint take = min(K, (uint)BF_MAX_K);
+    float heap_d[BF_MAX_K];
+    uint  heap_n[BF_MAX_K];
+    for (uint k = 0; k < take; ++k) { heap_d[k] = INFINITY; heap_n[k] = 0xFFFFFFFFu; }
+
+    for (uint n = t_id; n < N; n += n_threads) {
+        const device float4* dv = (const device float4*)(dataset + (ulong)n * D);
+        float dot_qd = 0.f;
+        for (uint d = 0; d < D4; ++d) dot_qd += dot(qv[d], dv[d]);
+        float dist = q_norm - 2.f * dot_qd + d_norms[n];
+        float worst = heap_d[0]; uint wi = 0u;
+        for (uint k = 1u; k < take; ++k) { if (heap_d[k] > worst) { worst = heap_d[k]; wi = k; } }
+        if (dist < worst) { heap_d[wi] = dist; heap_n[wi] = n; }
+    }
+
+    // 128 threads × 16 slots × 4 bytes × 2 arrays = 16KB < 32KB limit
+    threadgroup float tg_d[BF_N_THREADS * BF_MAX_K];
+    threadgroup uint  tg_n[BF_N_THREADS * BF_MAX_K];
+    const uint off = t_id * take;
+    for (uint k = 0; k < take; ++k) { tg_d[off+k] = heap_d[k]; tg_n[off+k] = heap_n[k]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (t_id == 0) {
+        float gd[BF_MAX_K]; uint gn[BF_MAX_K];
+        for (uint k = 0; k < take; ++k) { gd[k] = INFINITY; gn[k] = 0xFFFFFFFFu; }
+        for (uint i = 0; i < n_threads * take; ++i) {
+            if (tg_n[i] == 0xFFFFFFFFu) continue;
+            float worst = gd[0]; uint wi = 0u;
+            for (uint k = 1u; k < take; ++k) { if (gd[k] > worst) { worst = gd[k]; wi = k; } }
+            if (tg_d[i] < worst) { gd[wi] = tg_d[i]; gn[wi] = tg_n[i]; }
+        }
+        // Insertion sort for output ordering
+        for (uint i = 1; i < take; ++i) {
+            float kd = gd[i]; uint kn = gn[i]; int j = (int)i-1;
+            while (j >= 0 && gd[j] > kd) { gd[j+1] = gd[j]; gn[j+1] = gn[j]; --j; }
+            gd[j+1] = kd; gn[j+1] = kn;
+        }
+        const ulong qK = (ulong)q_id * K;
+        for (uint k = 0; k < take; ++k) { out_dist[qK+k] = gd[k]; out_idx[qK+k] = gn[k]; }
+    }
+}
+
 // P4: brute-force L2 distance — one thread per base vector.
 // Each thread computes squared Euclidean distance from base vector gid to the query.
 // dataset: N x D row-major float32
