@@ -277,13 +277,16 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
         constexpr int n_probe  = 3;   // probe own + 3 nearest clusters
         constexpr int64_t chunk = 4096; // chunk size for E-step to limit memory
 
-        // ── K-means initialization: uniform sampling ──────────────────
+        // ── K-means initialization: evenly-spaced strides ────────────────
+        // Random LCG can repeat indices (39% collision chance for K=316, N=100K)
+        // causing degenerate clusters. Stride-based spacing guarantees K distinct
+        // centroids spread evenly across the dataset.
         std::vector<float> centroids(static_cast<size_t>(K * D));
         {
-            uint64_t rng = 0x123456789ABCDEFULL;
+            const double stride = static_cast<double>(N) / K;
             for (int64_t k = 0; k < K; ++k) {
-                rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
-                int64_t idx = static_cast<int64_t>(rng >> 33) % N;
+                int64_t idx = static_cast<int64_t>(k * stride + stride * 0.5);
+                idx = std::min(idx, N - 1);
                 std::copy_n(dataset + idx*D, static_cast<size_t>(D),
                             centroids.data() + k*D);
             }
@@ -381,91 +384,75 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
         }
 
         // ── For each cluster, probe own + near clusters, compute k-NN ──
-        for (int64_t k = 0; k < K; ++k) {
-            const auto& own = clusters[static_cast<size_t>(k)];
-            if (own.empty()) continue;
+        // Cap own to max_own = N/K*4 to handle mildly unbalanced clusters.
+        // With evenly-spaced init, most clusters are ~N/K in size; the cap
+        // prevents the rare oversized cluster from causing OOM.
+        const int64_t max_own = (N / K) * 4 + 64;
 
-            // Gather probe set: own + near clusters
-            // Cap at MAX_PROBE to prevent degenerate large clusters
-            // (K-means init collisions can create unbalanced clusters).
-            constexpr int64_t MAX_PROBE = 8192;
+        for (int64_t k = 0; k < K; ++k) {
+            const auto& own_full = clusters[static_cast<size_t>(k)];
+            if (own_full.empty()) continue;
+
+            // Sub-sample own if oversized
+            const int64_t nk = std::min(static_cast<int64_t>(own_full.size()), max_own);
+
+            // Build probe set: own (capped) + near clusters
             std::vector<uint32_t> probe;
-            probe.reserve(std::min(MAX_PROBE,
-                static_cast<int64_t>((1 + n_probe) * (N / K + 1))));
-            for (auto v : own) {
-                if (static_cast<int64_t>(probe.size()) >= MAX_PROBE) break;
-                probe.push_back(v);
-            }
-            for (auto nk : near_clusters[static_cast<size_t>(k)]) {
-                for (auto v : clusters[static_cast<size_t>(nk)]) {
-                    if (static_cast<int64_t>(probe.size()) >= MAX_PROBE) break;
+            probe.reserve(static_cast<size_t>(nk +
+                static_cast<int64_t>(n_probe) * (N / K + 1)));
+            for (int64_t i = 0; i < nk; ++i)
+                probe.push_back(own_full[static_cast<size_t>(i)]);
+            for (auto nc : near_clusters[static_cast<size_t>(k)])
+                for (auto v : clusters[static_cast<size_t>(nc)])
                     probe.push_back(v);
-                }
-                if (static_cast<int64_t>(probe.size()) >= MAX_PROBE) break;
-            }
-            const int64_t M  = static_cast<int64_t>(probe.size());
-            const int64_t nk = static_cast<int64_t>(own.size());
+
+            const int64_t M = static_cast<int64_t>(probe.size());
             if (M <= 1) continue;
 
-            // Gather probe vectors (capped at MAX_PROBE)
+            // Gather probe vectors and compute distances
             std::vector<float> probe_vecs(static_cast<size_t>(M * D));
             std::vector<float> probe_norms(static_cast<size_t>(M));
             for (int64_t m = 0; m < M; ++m) {
-                std::copy_n(dataset + probe[static_cast<size_t>(m)]*D,
-                            static_cast<size_t>(D),
+                uint32_t pv = probe[static_cast<size_t>(m)];
+                std::copy_n(dataset + pv*D, static_cast<size_t>(D),
                             probe_vecs.data() + m*D);
-                probe_norms[static_cast<size_t>(m)] =
-                    norms[static_cast<size_t>(probe[static_cast<size_t>(m)])];
+                probe_norms[static_cast<size_t>(m)] = norms[static_cast<size_t>(pv)];
             }
+            std::vector<float> own_vecs(static_cast<size_t>(nk * D));
+            for (int64_t i = 0; i < nk; ++i)
+                std::copy_n(dataset + own_full[static_cast<size_t>(i)]*D,
+                            static_cast<size_t>(D), own_vecs.data() + i*D);
 
-            // Process own cluster in batches to bound sgemm size.
-            // cross[batch×M] = own_batch[batch×D] @ probe_vecs[M×D]^T
-            // MAX_BATCH prevents OOM for degenerate large clusters.
-            constexpr int64_t MAX_BATCH = 4096;
-            std::vector<float> batch_vecs(static_cast<size_t>(
-                std::min(nk, MAX_BATCH) * D));
-            std::vector<float> cross_batch(static_cast<size_t>(
-                std::min(nk, MAX_BATCH) * M));
+            // cross[nk×M] = own_vecs @ probe_vecs^T  (AMX)
+            std::vector<float> cross_nm(static_cast<size_t>(nk * M));
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        (int)nk, (int)M, (int)D,
+                        1.0f, own_vecs.data(), (int)D,
+                        probe_vecs.data(), (int)D,
+                        0.0f, cross_nm.data(), (int)M);
+
             std::vector<uint32_t> midx(static_cast<size_t>(M));
-
-            for (int64_t istart = 0; istart < nk; istart += MAX_BATCH) {
-                const int64_t iend  = std::min(istart + MAX_BATCH, nk);
-                const int64_t ibsz  = iend - istart;
-
-                for (int64_t ii = 0; ii < ibsz; ++ii)
-                    std::copy_n(dataset + own[static_cast<size_t>(istart+ii)]*D,
-                                static_cast<size_t>(D),
-                                batch_vecs.data() + ii*D);
-
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                            (int)ibsz, (int)M, (int)D,
-                            1.0f, batch_vecs.data(), (int)D,
-                            probe_vecs.data(), (int)D,
-                            0.0f, cross_batch.data(), (int)M);
-
-            for (int64_t i = istart; i < iend; ++i) {
-                const uint32_t vi = own[static_cast<size_t>(i)];
-                const float ni    = norms[static_cast<size_t>(vi)];
-                const float* cr   = cross_batch.data() + (i-istart)*M;
+            for (int64_t i = 0; i < nk; ++i) {
+                const uint32_t vi = own_full[static_cast<size_t>(i)];
+                const float ni = norms[static_cast<size_t>(vi)];
+                const float* cr = cross_nm.data() + i*M;
                 std::iota(midx.begin(), midx.end(), 0u);
                 const int64_t take = std::min((int64_t)G, M-1);
                 std::partial_sort(midx.begin(), midx.begin()+take, midx.end(),
                     [&](uint32_t a, uint32_t b) {
-                        if (probe[static_cast<size_t>(a)] == vi) return false;
-                        if (probe[static_cast<size_t>(b)] == vi) return true;
-                        float da = ni - 2.f*cr[a] + probe_norms[a];
-                        float db = ni - 2.f*cr[b] + probe_norms[b];
-                        return da < db;
+                        if (probe[a] == vi) return false;
+                        if (probe[b] == vi) return true;
+                        return ni-2.f*cr[a]+probe_norms[a] <
+                               ni-2.f*cr[b]+probe_norms[b];
                     });
                 for (int64_t t = 0; t < take; ++t) {
-                    uint32_t m_idx = midx[static_cast<size_t>(t)];
-                    uint32_t nbr   = probe[static_cast<size_t>(m_idx)];
+                    uint32_t nbr = probe[midx[static_cast<size_t>(t)]];
                     if (nbr == vi) continue;
-                    float d = ni - 2.f*cr[m_idx] + probe_norms[static_cast<size_t>(m_idx)];
+                    float d = ni - 2.f*cr[midx[static_cast<size_t>(t)]]
+                              + probe_norms[midx[static_cast<size_t>(t)]];
                     insert_neighbor(vi, nbr, d);
                 }
             }
-            } // end batch loop (istart)
         }
     } // end IVF seeding
 
