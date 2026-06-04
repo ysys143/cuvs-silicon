@@ -198,6 +198,131 @@ kernel void cagra_beam_search(
     }
 }
 
+// Multi-CTA beam search: N_TEAMS independent teams per query.
+// Grid: threadgroups(Q, N_TEAMS, 1), threads(G_threads, 1, 1).
+// Each team gets its own seed (diversified entry point) and its own
+// visited bitfield → no inter-team synchronization needed, no atomics.
+// Host merges N_TEAMS × beam_size candidates into top-K after kernel.
+kernel void cagra_beam_search_multi_cta(
+    device const float*  dataset     [[ buffer(0) ]],  // N×D
+    device const uint*   graph       [[ buffer(1) ]],  // N×G
+    device const float*  queries     [[ buffer(2) ]],  // Q×D
+    device float*        team_dists  [[ buffer(3) ]],  // Q×N_TEAMS×beam_size
+    device uint*         team_nodes  [[ buffer(4) ]],  // Q×N_TEAMS×beam_size
+    device uint*         visited     [[ buffer(5) ]],  // Q×N_TEAMS×ceil(N/32)
+    constant uint&       N           [[ buffer(6) ]],
+    constant uint&       D           [[ buffer(7) ]],
+    constant uint&       G           [[ buffer(8) ]],
+    constant uint&       K           [[ buffer(9) ]],
+    constant uint&       beam_size   [[ buffer(10) ]],
+    constant uint&       max_iter    [[ buffer(11) ]],
+    constant uint&       N_TEAMS     [[ buffer(12) ]],
+    device const uint*   entry_nodes [[ buffer(13) ]],  // Q entry points
+    uint q_id      [[ threadgroup_position_in_grid_x ]],
+    uint team_id   [[ threadgroup_position_in_grid_y ]],
+    uint t_id      [[ thread_position_in_threadgroup ]],
+    uint n_threads [[ threads_per_threadgroup ]])
+{
+    const uint vw       = (N + 31u) / 32u;
+    const ulong qT      = (ulong)q_id * N_TEAMS + team_id;
+    const ulong qD      = (ulong)q_id * D;
+    const ulong qBS     = qT * beam_size;
+    const ulong qVW     = qT * vw;
+
+    threadgroup uint  best_node[1];
+    threadgroup float best_dist_tg[1];
+    threadgroup float tg_dist[128];
+    threadgroup uint  tg_node[128];
+
+    // ── Init: team-specific seed ──────────────────────────────────────
+    if (t_id == 0) {
+        // Diversify starting point per team: rotate entry node by N/N_TEAMS
+        uint base_seed = (entry_nodes[q_id] < N) ? entry_nodes[q_id]
+                                                  : (q_id * 2654435761u) % N;
+        const uint seed = (base_seed + team_id * (N / N_TEAMS)) % N;
+
+        float d = 0.f;
+        for (uint i = 0; i < D; ++i) {
+            float delta = queries[qD + i] - dataset[(ulong)seed * D + i];
+            d += delta * delta;
+        }
+        team_dists[qBS + 0] = d;
+        team_nodes[qBS + 0] = seed;
+        for (uint i = 1; i < beam_size; ++i) {
+            team_dists[qBS + i] = INFINITY;
+            team_nodes[qBS + i] = 0xFFFFFFFFu;
+        }
+        visited[qVW + (seed >> 5u)] |= (1u << (seed & 31u));
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // ── Beam search loop (identical logic to single-CTA) ─────────────
+    for (uint iter = 0; iter < max_iter; ++iter) {
+
+        if (t_id == 0) {
+            float bd = INFINITY; uint bn = 0xFFFFFFFFu;
+            for (uint i = 0; i < beam_size; ++i) {
+                float cd = team_dists[qBS + i];
+                if (cd >= 0.f && cd < bd) { bd = cd; bn = team_nodes[qBS + i]; }
+            }
+            if (bn != 0xFFFFFFFFu) {
+                for (uint i = 0; i < beam_size; ++i) {
+                    if (team_nodes[qBS + i] == bn) {
+                        team_dists[qBS + i] = -team_dists[qBS + i] - 1.f;
+                        break;
+                    }
+                }
+            }
+            best_node[0] = bn; best_dist_tg[0] = bd;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+        if (best_node[0] == 0xFFFFFFFFu) break;
+
+        const uint  expand = best_node[0];
+        const ulong gBase  = (ulong)expand * G;
+
+        for (uint g = t_id; g < G; g += n_threads) {
+            const uint nbr = graph[gBase + g];
+            if (nbr < N) {
+                float d = 0.f;
+                const ulong nB = (ulong)nbr * D;
+                for (uint dd = 0; dd < D; ++dd) {
+                    float delta = queries[qD + dd] - dataset[nB + dd];
+                    d += delta * delta;
+                }
+                tg_dist[g] = d; tg_node[g] = nbr;
+            } else {
+                tg_dist[g] = INFINITY; tg_node[g] = 0xFFFFFFFFu;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (t_id == 0) {
+            for (uint g = 0; g < G; ++g) {
+                const uint nbr = tg_node[g];
+                if (nbr == 0xFFFFFFFFu) continue;
+                const uint wrd = nbr >> 5u, bit = 1u << (nbr & 31u);
+                if (visited[qVW + wrd] & bit) continue;
+                visited[qVW + wrd] |= bit;
+                const float dist = tg_dist[g];
+                float worst = 0.f; uint widx = beam_size;
+                for (uint i = 0; i < beam_size; ++i) {
+                    float cd = team_dists[qBS + i];
+                    float absd = cd < 0.f ? (-cd - 1.f) : cd;
+                    if (absd > worst) { worst = absd; widx = i; }
+                }
+                if (widx < beam_size && dist < worst) {
+                    team_dists[qBS + widx] = dist;
+                    team_nodes[qBS + widx] = nbr;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+    // Results remain in team_dists/team_nodes; host merges into top-K.
+}
+
 // nn-descent: graph refinement kernel.
 // Each threadgroup handles one node. Threads compute distances to 2-hop candidates.
 // If any 2-hop neighbor improves the current k-NN list, the graph is updated.

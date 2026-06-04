@@ -23,12 +23,13 @@ struct MetalContext::Impl {
     id<MTLDevice>               device   = nil;
     id<MTLCommandQueue>         queue    = nil;
     id<MTLLibrary>              library  = nil;
-    id<MTLComputePipelineState> pso_copy               = nil;
-    id<MTLComputePipelineState> pso_beam_search        = nil;
-    id<MTLComputePipelineState> pso_nn_descent         = nil;
-    id<MTLComputePipelineState> pso_random_bucketing   = nil;
-    id<MTLComputePipelineState> pso_brute_force_topk   = nil;
-    id<MTLComputePipelineState> pso_l2_topk_from_cross = nil;
+    id<MTLComputePipelineState> pso_copy                  = nil;
+    id<MTLComputePipelineState> pso_beam_search           = nil;
+    id<MTLComputePipelineState> pso_beam_search_multi_cta = nil;
+    id<MTLComputePipelineState> pso_nn_descent            = nil;
+    id<MTLComputePipelineState> pso_random_bucketing      = nil;
+    id<MTLComputePipelineState> pso_brute_force_topk      = nil;
+    id<MTLComputePipelineState> pso_l2_topk_from_cross    = nil;
     bool                        available = false;
     std::string                 chip_model_str;
 
@@ -73,12 +74,13 @@ MetalContext::MetalContext() : impl_(new Impl) {
             NSError* e = nil;
             return [impl_->device newComputePipelineStateWithFunction:fn error:&e];
         };
-        impl_->pso_copy               = make_pso(@"copy_kernel");
-        impl_->pso_beam_search        = make_pso(@"cagra_beam_search");
-        impl_->pso_nn_descent         = make_pso(@"nn_descent");
-        impl_->pso_random_bucketing   = make_pso(@"random_bucketing");
-        impl_->pso_brute_force_topk   = make_pso(@"brute_force_topk");
-        impl_->pso_l2_topk_from_cross = make_pso(@"l2_topk_from_cross");
+        impl_->pso_copy                  = make_pso(@"copy_kernel");
+        impl_->pso_beam_search           = make_pso(@"cagra_beam_search");
+        impl_->pso_beam_search_multi_cta = make_pso(@"cagra_beam_search_multi_cta");
+        impl_->pso_nn_descent            = make_pso(@"nn_descent");
+        impl_->pso_random_bucketing      = make_pso(@"random_bucketing");
+        impl_->pso_brute_force_topk      = make_pso(@"brute_force_topk");
+        impl_->pso_l2_topk_from_cross    = make_pso(@"l2_topk_from_cross");
 
         impl_->chip_model_str = impl_->device.name.UTF8String;
         impl_->available      = true;
@@ -701,6 +703,115 @@ uint64_t MetalContext::search_cagra(
     if (!impl_->pso_beam_search)
         throw std::runtime_error("cagra_beam_search kernel not compiled");
 
+    // ── Multi-CTA path for small Q: dispatch N_TEAMS teams per query ──
+    // Each team starts from a different entry point, explores independently.
+    // Host merges N_TEAMS × beam_size candidates → top-K per query.
+    // Q=1→16 teams, Q≤4→8, Q≤16→4, Q>16→1 (fall through to single-CTA).
+    const uint32_t N_TEAMS = (impl_->pso_beam_search_multi_cta && Q <= 16)
+        ? (Q == 1 ? 16u : Q <= 4 ? 8u : 4u)
+        : 1u;
+
+    if (N_TEAMS > 1) {
+        @autoreleasepool {
+            const uint32_t visited_words = (static_cast<uint32_t>(N) + 31u) / 32u;
+            // Multi-CTA uses smaller beam for speed; diversity compensates quality.
+            const uint32_t mc_beam = std::min(beam_size, 32u);
+
+            auto buf_dataset = make_shared_buf(impl_->device, dataset,
+                                   (NSUInteger)(N * D * sizeof(float)));
+            auto buf_graph   = make_shared_buf(impl_->device, knn_graph,
+                                   (NSUInteger)((uint64_t)N * G * sizeof(uint32_t)));
+            auto buf_queries = make_shared_buf(impl_->device, queries,
+                                   (NSUInteger)(Q * D * sizeof(float)));
+
+            // per-team candidate buffers: Q × N_TEAMS × mc_beam
+            const size_t team_buf_sz = (size_t)Q * N_TEAMS * mc_beam;
+            auto buf_team_dists = make_empty_buf(impl_->device,
+                                      (NSUInteger)(team_buf_sz * 4u));
+            auto buf_team_nodes = make_empty_buf(impl_->device,
+                                      (NSUInteger)(team_buf_sz * 4u));
+            // per-team visited: Q × N_TEAMS × visited_words
+            auto buf_visited = make_empty_buf(impl_->device,
+                                   (NSUInteger)((uint64_t)Q * N_TEAMS * visited_words * 4u));
+            memset(buf_visited.contents, 0,
+                   (size_t)((uint64_t)Q * N_TEAMS * visited_words * 4u));
+
+            // Entry nodes buffer
+            std::vector<uint32_t> entry_buf_data(static_cast<size_t>(Q),
+                                                  std::numeric_limits<uint32_t>::max());
+            if (entry_nodes)
+                std::copy_n(entry_nodes, static_cast<size_t>(Q), entry_buf_data.data());
+            auto buf_entry = make_shared_buf(impl_->device, entry_buf_data.data(),
+                                  (NSUInteger)(Q * sizeof(uint32_t)));
+
+            uint32_t uN=(uint32_t)N, uD=(uint32_t)D, uG=G, uK=(uint32_t)K,
+                     uNT=N_TEAMS;
+            const NSUInteger tpq = std::min((uint32_t)G, 32u);
+
+            auto cmd = [impl_->queue commandBuffer];
+            auto enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:impl_->pso_beam_search_multi_cta];
+            [enc setBuffer:buf_dataset    offset:0 atIndex:0];
+            [enc setBuffer:buf_graph      offset:0 atIndex:1];
+            [enc setBuffer:buf_queries    offset:0 atIndex:2];
+            [enc setBuffer:buf_team_dists offset:0 atIndex:3];
+            [enc setBuffer:buf_team_nodes offset:0 atIndex:4];
+            [enc setBuffer:buf_visited    offset:0 atIndex:5];
+            [enc setBytes:&uN       length:4 atIndex:6];
+            [enc setBytes:&uD       length:4 atIndex:7];
+            [enc setBytes:&uG       length:4 atIndex:8];
+            [enc setBytes:&uK       length:4 atIndex:9];
+            [enc setBytes:&mc_beam  length:4 atIndex:10];
+            [enc setBytes:&max_iter length:4 atIndex:11];
+            [enc setBytes:&uNT      length:4 atIndex:12];
+            [enc setBuffer:buf_entry offset:0 atIndex:13];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)Q, N_TEAMS, 1)
+                threadsPerThreadgroup:MTLSizeMake(tpq, 1, 1)];
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+
+            if (cmd.error)
+                throw std::runtime_error(cmd.error.localizedDescription.UTF8String);
+
+            // ── CPU merge: N_TEAMS × mc_beam candidates → top-K per query ──
+            const auto* td = static_cast<const float*>(buf_team_dists.contents);
+            const auto* tn = static_cast<const uint32_t*>(buf_team_nodes.contents);
+            for (int64_t q = 0; q < Q; ++q) {
+                // Collect all valid candidates from all teams
+                std::vector<std::pair<float, uint32_t>> cands;
+                cands.reserve(N_TEAMS * mc_beam);
+                for (uint32_t t = 0; t < N_TEAMS; ++t) {
+                    const size_t base = ((size_t)q * N_TEAMS + t) * mc_beam;
+                    for (uint32_t b = 0; b < mc_beam; ++b) {
+                        uint32_t node = tn[base + b];
+                        if (node == 0xFFFFFFFFu) continue;
+                        float d = td[base + b];
+                        float absd = d < 0.f ? (-d - 1.f) : d;
+                        cands.emplace_back(absd, node);
+                    }
+                }
+                // Deduplicate and partial-sort for top-K
+                std::sort(cands.begin(), cands.end());
+                cands.erase(std::unique(cands.begin(), cands.end(),
+                    [](const auto& a, const auto& b){ return a.second == b.second; }),
+                    cands.end());
+                const int64_t take = std::min((int64_t)K, (int64_t)cands.size());
+                for (int64_t k = 0; k < K; ++k) {
+                    if (k < take) {
+                        out_nbrs [q * K + k] = cands[static_cast<size_t>(k)].second;
+                        out_dists[q * K + k] = cands[static_cast<size_t>(k)].first;
+                    } else {
+                        out_nbrs [q * K + k] = 0xFFFFFFFFu;
+                        out_dists[q * K + k] = std::numeric_limits<float>::infinity();
+                    }
+                }
+            }
+        }
+        return 1;
+    }
+
+    // ── Single-CTA path (Q > 16 or multi-CTA unavailable) ────────────
     @autoreleasepool {
         const uint32_t visited_words = (static_cast<uint32_t>(N) + 31u) / 32u;
 
@@ -717,21 +828,15 @@ uint64_t MetalContext::search_cagra(
                                (NSUInteger)(Q * K * sizeof(float)));
 
         // ── Working buffers ───────────────────────────────────────────
-        // cand_dists: Q × beam_size floats
         auto buf_cand_dists = make_empty_buf(impl_->device,
                                (NSUInteger)((uint64_t)Q * beam_size * 4u));
-        // cand_nodes: Q × beam_size uint32
         auto buf_cand_nodes = make_empty_buf(impl_->device,
                                (NSUInteger)((uint64_t)Q * beam_size * 4u));
-        // visited bitfield: Q × visited_words × uint32
         auto buf_visited = make_empty_buf(impl_->device,
                                (NSUInteger)((uint64_t)Q * visited_words * 4u));
-
         memset(buf_visited.contents, 0,
                (size_t)((uint64_t)Q * visited_words * 4u));
 
-        // Multithreaded: each thread computes distances in parallel,
-        // thread 0 merges results into the beam (no atomic races).
         const NSUInteger threads_per_query = std::min((uint32_t)G, 32u);
 
         auto cmd = [impl_->queue commandBuffer];
@@ -754,7 +859,6 @@ uint64_t MetalContext::search_cagra(
         [enc setBytes:&beam_size length:4 atIndex:12];
         [enc setBytes:&max_iter  length:4 atIndex:13];
 
-        // Entry nodes: Q uint32 values (provided or 0xFFFFFFFF = use hash)
         std::vector<uint32_t> entry_buf_data(static_cast<size_t>(Q),
                                               std::numeric_limits<uint32_t>::max());
         if (entry_nodes)
@@ -772,7 +876,6 @@ uint64_t MetalContext::search_cagra(
         if (cmd.error)
             throw std::runtime_error(cmd.error.localizedDescription.UTF8String);
 
-        // Copy results back from shared MTLBuffers to caller's pointers
         std::copy_n((const uint32_t*)buf_out_nbrs.contents,
                     (size_t)(Q * K), out_nbrs);
         std::copy_n((const float*)buf_out_dists.contents,
