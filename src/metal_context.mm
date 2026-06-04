@@ -439,34 +439,29 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
         std::vector<float>   pq_centers(static_cast<size_t>(PQ_M * PQ_K * PQ_DIM));
         std::vector<uint8_t> pq_codes(static_cast<size_t>(N * PQ_M));
 
+        // Use dataset directly with lda=D stride — no sub_vecs copy needed.
+        // cblas_sgemm supports non-unit leading dimension for strided access.
         {
-            std::vector<float> sub_vecs(static_cast<size_t>(N * PQ_DIM));
-            std::vector<float> sub_cross(static_cast<size_t>(chunk * PQ_K));
+            std::vector<float>   sub_cross(static_cast<size_t>(chunk * PQ_K));
             std::vector<int32_t> sub_assign(static_cast<size_t>(N), 0);
-            std::vector<float>  ctr_norms(static_cast<size_t>(PQ_K));
+            std::vector<float>   ctr_norms(static_cast<size_t>(PQ_K));
             std::vector<int64_t> counts(static_cast<size_t>(PQ_K), 0LL);
 
             for (int64_t m = 0; m < PQ_M; ++m) {
                 const int64_t dim_off = m * PQ_DIM;
                 float* ctr = pq_centers.data() + m * PQ_K * PQ_DIM;
 
-                // Extract sub-vectors for this subspace
-                for (int64_t i = 0; i < N; ++i)
-                    std::copy_n(dataset + i*D + dim_off, PQ_DIM,
-                                sub_vecs.data() + i*PQ_DIM);
-
-                // Init centers: stride-based
+                // Init centers: stride-based (read directly from dataset)
                 {
                     const double stride = static_cast<double>(N) / PQ_K;
                     for (int c = 0; c < PQ_K; ++c) {
                         int64_t idx = static_cast<int64_t>(c * stride + stride * 0.5);
                         idx = std::min(idx, N - 1);
-                        std::copy_n(sub_vecs.data() + idx*PQ_DIM, PQ_DIM,
-                                    ctr + c*PQ_DIM);
+                        std::copy_n(dataset + idx*D + dim_off, PQ_DIM, ctr + c*PQ_DIM);
                     }
                 }
 
-                // K-means E-M for this subspace
+                // K-means E-M: sgemm with lda=D reads subspace directly from dataset
                 for (int iter = 0; iter < pq_iters; ++iter) {
                     for (int c = 0; c < PQ_K; ++c) {
                         float s = 0.f;
@@ -478,17 +473,18 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
                         const int64_t Bs = std::min(chunk, N - start);
                         if (static_cast<int64_t>(sub_cross.size()) < Bs * PQ_K)
                             sub_cross.resize(static_cast<size_t>(Bs * PQ_K));
+                        // lda=D: each row of dataset has D elements, we read PQ_DIM from offset
                         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                                     (int)Bs, (int)PQ_K, (int)PQ_DIM,
-                                    1.0f, sub_vecs.data() + start*PQ_DIM, (int)PQ_DIM,
+                                    1.0f, dataset + start*D + dim_off, (int)D,
                                     ctr, (int)PQ_DIM,
                                     0.0f, sub_cross.data(), (int)PQ_K);
                         for (int64_t b = 0; b < Bs; ++b) {
                             const int64_t vi = start + b;
+                            // norm of subspace slice
                             float vi_norm = 0.f;
-                            for (int d = 0; d < PQ_DIM; ++d) {
-                                float v = sub_vecs[vi*PQ_DIM+d]; vi_norm += v*v;
-                            }
+                            const float* sv = dataset + vi*D + dim_off;
+                            for (int d = 0; d < PQ_DIM; ++d) vi_norm += sv[d]*sv[d];
                             float best_d = std::numeric_limits<float>::infinity();
                             int32_t best_c = 0;
                             for (int c = 0; c < PQ_K; ++c) {
@@ -499,14 +495,14 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
                         }
                     }
                     if (!changed) break;
-                    // M-step
+                    // M-step: accumulate directly from dataset with stride
                     std::fill(ctr, ctr + PQ_K * PQ_DIM, 0.f);
                     std::fill(counts.begin(), counts.end(), 0LL);
                     for (int64_t i = 0; i < N; ++i) {
                         int c = sub_assign[i];
                         counts[static_cast<size_t>(c)]++;
                         cblas_saxpy((int)PQ_DIM, 1.0f,
-                                    sub_vecs.data() + i*PQ_DIM, 1,
+                                    dataset + i*D + dim_off, 1,
                                     ctr + c*PQ_DIM, 1);
                     }
                     for (int c = 0; c < PQ_K; ++c)
@@ -515,18 +511,27 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
                                         ctr + c*PQ_DIM, 1);
                 }
 
-                // Encode: assign each vector to nearest center
-                for (int64_t i = 0; i < N; ++i) {
-                    float best_d = std::numeric_limits<float>::infinity();
-                    uint8_t best_c = 0;
-                    const float* sv = sub_vecs.data() + i*PQ_DIM;
-                    for (int c = 0; c < PQ_K; ++c) {
-                        float dd = 0.f;
-                        const float* ct = ctr + c*PQ_DIM;
-                        for (int d = 0; d < PQ_DIM; ++d) { float dif = sv[d]-ct[d]; dd += dif*dif; }
-                        if (dd < best_d) { best_d = dd; best_c = (uint8_t)c; }
+                // Encoding: one final E-step via sgemm (same as K-means E-step)
+                for (int64_t start = 0; start < N; start += chunk) {
+                    const int64_t Bs = std::min(chunk, N - start);
+                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                                (int)Bs, (int)PQ_K, (int)PQ_DIM,
+                                1.0f, dataset + start*D + dim_off, (int)D,
+                                ctr, (int)PQ_DIM,
+                                0.0f, sub_cross.data(), (int)PQ_K);
+                    for (int64_t b = 0; b < Bs; ++b) {
+                        const int64_t vi = start + b;
+                        const float* sv = dataset + vi*D + dim_off;
+                        float vi_norm = 0.f;
+                        for (int d = 0; d < PQ_DIM; ++d) vi_norm += sv[d]*sv[d];
+                        float best_d = std::numeric_limits<float>::infinity();
+                        uint8_t best_c = 0;
+                        for (int c = 0; c < PQ_K; ++c) {
+                            float dd = vi_norm - 2.f*sub_cross[b*PQ_K+c] + ctr_norms[c];
+                            if (dd < best_d) { best_d = dd; best_c = (uint8_t)c; }
+                        }
+                        pq_codes[vi * PQ_M + m] = best_c;
                     }
-                    pq_codes[i * PQ_M + m] = best_c;
                 }
             }
         }
