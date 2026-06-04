@@ -434,6 +434,15 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
             }
         }
 
+        // PQ constants at outer scope (used in seeding regardless of path)
+        constexpr int64_t PQ_SEEDING_THRESHOLD = 200000; // exact sgemm for N ≤ this
+        constexpr int64_t PQ_M   = 8;        // subspaces
+        constexpr int64_t PQ_DIM = 128;      // dims per subspace (D/PQ_M)
+        constexpr int     PQ_K   = 256;      // centers per subspace
+        constexpr int     pq_iters = 10;
+        std::vector<uint8_t> pq_codes;       // populated if N > threshold
+        std::vector<float>   pq_lut;         // populated if N > threshold
+
         fprintf(stderr, "\n  [build] K-means done (%.1fs)\n", elapsed_s());
         fflush(stderr);
 
@@ -441,17 +450,8 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
         fprintf(stderr, "  [build] PQ training...");
         fflush(stderr);
 
-        // ── IVF_PQ: Product Quantization encoding (replaces probe_vecs gather) ──
-        // Reduces random-access gather from 16MB per cluster → 32KB.
-        // PQ_M subspaces each with 256 centers, stored as uint8 codes.
-        // LUT (2MB) fits in L3 cache; pq_codes (8MB) mostly in L3 too.
-        constexpr int64_t PQ_M   = 8;        // subspaces — LUT=2MB fits in L2 cache
-        constexpr int64_t PQ_DIM = 128;      // dims per subspace (D/PQ_M = 1024/8)
-        constexpr int     PQ_K   = 256;      // centers per subspace (8-bit codes)
-        constexpr int     pq_iters = 10;     // K-means iterations for PQ subspaces
-
         std::vector<float>   pq_centers(static_cast<size_t>(PQ_M * PQ_K * PQ_DIM));
-        std::vector<uint8_t> pq_codes(static_cast<size_t>(N * PQ_M));
+        pq_codes.resize(static_cast<size_t>(N * PQ_M));
 
         // Use dataset directly with lda=D stride — no sub_vecs copy needed.
         // cblas_sgemm supports non-unit leading dimension for strided access.
@@ -552,7 +552,7 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
 
         // ── Precompute symmetric PQ LUT: lut[m×K×K + a×K + b] = dist(ctr[m][a], ctr[m][b])
         // Size: PQ_M × 256 × 256 × 4 bytes = 8 × 256KB = 2MB → fits in L3 cache.
-        std::vector<float> pq_lut(static_cast<size_t>(PQ_M * PQ_K * PQ_K));
+        pq_lut.resize(static_cast<size_t>(PQ_M * PQ_K * PQ_K));
         for (int64_t m = 0; m < PQ_M; ++m) {
             const float* ctr_m = pq_centers.data() + m * PQ_K * PQ_DIM;
             for (int a = 0; a < PQ_K; ++a) {
@@ -610,13 +610,10 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
             }
         }
 
-        // ── Seeding strategy: exact sgemm (N≤200K) or PQ (N>200K) ─────────
-        // Exact sgemm gives better quality (recall ~0.99 after 2 nd iters).
-        // PQ is necessary at 1M scale to avoid O(N^1.5) sgemm bottleneck.
-        constexpr int64_t PQ_SEEDING_THRESHOLD = 200000;
         const int64_t max_own = (N / K) * 4 + 64;
 
-        // CPU PQ seeding: per-cluster PQ distance lookup + insert_neighbor
+        if (N > PQ_SEEDING_THRESHOLD) {
+        // ── CPU PQ seeding (N>200K): LUT distance lookup → exact L2 on GPU ──
         for (int64_t k = 0; k < K; ++k) {
             if (k % (K / 10 + 1) == 0) {
                 fprintf(stderr, "\r  [build] IVF seeding  %3lld%%",
@@ -711,6 +708,88 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
             }
         }
         fprintf(stderr, "  [build] L2 recompute done (%.1fs)\n", elapsed_s()); fflush(stderr);
+
+        } else {
+        // ── Exact sgemm seeding (N≤200K): best quality, fast enough ──────────
+        for (int64_t k = 0; k < K; ++k) {
+            if (k % (K / 10 + 1) == 0) {
+                fprintf(stderr, "\r  [build] IVF seeding  %3lld%%",
+                        (long long)(k * 100 / K)); fflush(stderr);
+            }
+            const auto& own_full = clusters[static_cast<size_t>(k)];
+            if (own_full.empty()) continue;
+            const int64_t nk = std::min(static_cast<int64_t>(own_full.size()), max_own);
+
+            std::vector<uint32_t> probe;
+            probe.reserve(static_cast<size_t>(nk +
+                static_cast<int64_t>(n_probe) * (N / K + 1)));
+            for (int64_t i = 0; i < nk; ++i)
+                probe.push_back(own_full[static_cast<size_t>(i)]);
+            for (auto nc : near_clusters[static_cast<size_t>(k)])
+                for (auto v : clusters[static_cast<size_t>(nc)])
+                    probe.push_back(v);
+            constexpr int64_t MAX_PROBE = 8192;
+            if (static_cast<int64_t>(probe.size()) > MAX_PROBE)
+                probe.resize(static_cast<size_t>(MAX_PROBE));
+            const int64_t M = static_cast<int64_t>(probe.size());
+            if (M <= 1) continue;
+
+            // Gather probe vectors (once per cluster)
+            std::vector<float> probe_vecs(static_cast<size_t>(M * D));
+            std::vector<float> probe_norms(static_cast<size_t>(M));
+            for (int64_t m = 0; m < M; ++m) {
+                uint32_t pv = probe[static_cast<size_t>(m)];
+                std::copy_n(dataset + pv*D, static_cast<size_t>(D),
+                            probe_vecs.data() + m*D);
+                probe_norms[static_cast<size_t>(m)] = norms[static_cast<size_t>(pv)];
+            }
+
+            constexpr int64_t MAX_BATCH = 256;
+            const int64_t n_batches_sgemm = (nk + MAX_BATCH - 1) / MAX_BATCH;
+            std::vector<float> batch_vecs(static_cast<size_t>(
+                std::min(nk, MAX_BATCH) * D));
+            std::vector<float> cross_batch(static_cast<size_t>(
+                std::min(nk, MAX_BATCH) * M));
+            std::vector<uint32_t> midx(static_cast<size_t>(M));
+            (void)n_batches_sgemm;
+
+            for (int64_t istart = 0; istart < nk; istart += MAX_BATCH) {
+                const int64_t iend = std::min(istart + MAX_BATCH, nk);
+                const int64_t ibsz = iend - istart;
+                for (int64_t ii = 0; ii < ibsz; ++ii)
+                    std::copy_n(dataset + own_full[static_cast<size_t>(istart+ii)]*D,
+                                static_cast<size_t>(D),
+                                batch_vecs.data() + ii*D);
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            (int)ibsz, (int)M, (int)D,
+                            1.0f, batch_vecs.data(), (int)D,
+                            probe_vecs.data(), (int)D,
+                            0.0f, cross_batch.data(), (int)M);
+                const int64_t take = std::min((int64_t)G, M-1);
+                for (int64_t i = istart; i < iend; ++i) {
+                    const uint32_t vi = own_full[static_cast<size_t>(i)];
+                    const float ni = norms[static_cast<size_t>(vi)];
+                    const float* cr = cross_batch.data() + (i-istart)*M;
+                    std::iota(midx.begin(), midx.end(), 0u);
+                    std::partial_sort(midx.begin(), midx.begin()+take, midx.end(),
+                        [&](uint32_t a, uint32_t b) {
+                            if (probe[a] == vi) return false;
+                            if (probe[b] == vi) return true;
+                            return ni-2.f*cr[a]+probe_norms[a] <
+                                   ni-2.f*cr[b]+probe_norms[b];
+                        });
+                    for (int64_t t = 0; t < take; ++t) {
+                        uint32_t nbr = probe[midx[static_cast<size_t>(t)]];
+                        if (nbr == vi) continue;
+                        float d = ni - 2.f*cr[midx[static_cast<size_t>(t)]]
+                                  + probe_norms[midx[static_cast<size_t>(t)]];
+                        insert_neighbor(vi, nbr, d);
+                    }
+                }
+            }
+        }
+        fprintf(stderr, "\r  [build] IVF seeding  100%%\n"); fflush(stderr);
+        } // end seeding (if/else N threshold)
     } // end IVF seeding
 
     // ── Phase 1b: Random bucketing pass (GPU-accelerated) ─────────────────
