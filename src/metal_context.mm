@@ -706,29 +706,11 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
                     std::copy_n((const uint32_t*)buf_graph.contents,
                                 static_cast<size_t>(N * G), graph.data());
 
-                    // Recompute EXACT L2 distances — GPU seeding stores PQ approx
-                    // distances which are on a different scale than true L2, causing
-                    // nn-descent comparisons to fail silently.
-                    for (int64_t vi = 0; vi < N; ++vi) {
-                        const float* vi_v = dataset + vi * D;
-                        for (uint32_t g = 0; g < G; ++g) {
-                            uint32_t nbr = graph[static_cast<size_t>(vi * G + g)];
-                            if (nbr == std::numeric_limits<uint32_t>::max()) {
-                                graph_dist[static_cast<size_t>(vi * G + g)] =
-                                    std::numeric_limits<float>::infinity();
-                                continue;
-                            }
-                            const float* nbr_v = dataset + nbr * D;
-                            float dist = 0.f;
-                            // float4 SIMD — same as nn_descent kernel style
-                            for (int64_t d = 0; d < D; d += 4) {
-                                float d0 = vi_v[d  ]-nbr_v[d  ], d1 = vi_v[d+1]-nbr_v[d+1];
-                                float d2 = vi_v[d+2]-nbr_v[d+2], d3 = vi_v[d+3]-nbr_v[d+3];
-                                dist += d0*d0 + d1*d1 + d2*d2 + d3*d3;
-                            }
-                            graph_dist[static_cast<size_t>(vi * G + g)] = dist;
-                        }
-                    }
+                    // PQ distances are on a different scale than exact L2 (PQ ≈ 0.01,
+                    // L2 ≈ 1.0+), so reset graph_dist to INFINITY for valid edges.
+                    // nn-descent will compute and store exact L2 on first iteration.
+                    std::fill(graph_dist.begin(), graph_dist.end(),
+                              std::numeric_limits<float>::infinity());
                 }
             }
         }
