@@ -431,8 +431,8 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
         // Reduces random-access gather from 16MB per cluster → 32KB.
         // PQ_M subspaces each with 256 centers, stored as uint8 codes.
         // LUT (2MB) fits in L3 cache; pq_codes (8MB) mostly in L3 too.
-        constexpr int64_t PQ_M   = 8;        // subspaces (D/PQ_DIM)
-        constexpr int64_t PQ_DIM = 128;      // dims per subspace (D/PQ_M = 1024/8)
+        constexpr int64_t PQ_M   = 4;        // subspaces — LUT=1MB fits in L2 cache
+        constexpr int64_t PQ_DIM = 256;      // dims per subspace (D/PQ_M = 1024/4)
         constexpr int     PQ_K   = 256;      // centers per subspace (8-bit codes)
         constexpr int     pq_iters = 10;     // K-means iterations for PQ training
 
