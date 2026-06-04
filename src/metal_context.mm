@@ -427,6 +427,126 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
         fprintf(stderr, "\n  [build] IVF seeding K=%lld  0%%", (long long)K);
         fflush(stderr);
 
+        // ── IVF_PQ: Product Quantization encoding (replaces probe_vecs gather) ──
+        // Reduces random-access gather from 16MB per cluster → 32KB.
+        // PQ_M subspaces each with 256 centers, stored as uint8 codes.
+        // LUT (2MB) fits in L3 cache; pq_codes (8MB) mostly in L3 too.
+        constexpr int64_t PQ_M   = 8;        // subspaces (D/PQ_DIM)
+        constexpr int64_t PQ_DIM = 128;      // dims per subspace (D/PQ_M = 1024/8)
+        constexpr int     PQ_K   = 256;      // centers per subspace (8-bit codes)
+        constexpr int     pq_iters = 10;     // K-means iterations for PQ training
+
+        std::vector<float>   pq_centers(static_cast<size_t>(PQ_M * PQ_K * PQ_DIM));
+        std::vector<uint8_t> pq_codes(static_cast<size_t>(N * PQ_M));
+
+        {
+            std::vector<float> sub_vecs(static_cast<size_t>(N * PQ_DIM));
+            std::vector<float> sub_cross(static_cast<size_t>(chunk * PQ_K));
+            std::vector<int32_t> sub_assign(static_cast<size_t>(N), 0);
+            std::vector<float>  ctr_norms(static_cast<size_t>(PQ_K));
+            std::vector<int64_t> counts(static_cast<size_t>(PQ_K), 0LL);
+
+            for (int64_t m = 0; m < PQ_M; ++m) {
+                const int64_t dim_off = m * PQ_DIM;
+                float* ctr = pq_centers.data() + m * PQ_K * PQ_DIM;
+
+                // Extract sub-vectors for this subspace
+                for (int64_t i = 0; i < N; ++i)
+                    std::copy_n(dataset + i*D + dim_off, PQ_DIM,
+                                sub_vecs.data() + i*PQ_DIM);
+
+                // Init centers: stride-based
+                {
+                    const double stride = static_cast<double>(N) / PQ_K;
+                    for (int c = 0; c < PQ_K; ++c) {
+                        int64_t idx = static_cast<int64_t>(c * stride + stride * 0.5);
+                        idx = std::min(idx, N - 1);
+                        std::copy_n(sub_vecs.data() + idx*PQ_DIM, PQ_DIM,
+                                    ctr + c*PQ_DIM);
+                    }
+                }
+
+                // K-means E-M for this subspace
+                for (int iter = 0; iter < pq_iters; ++iter) {
+                    for (int c = 0; c < PQ_K; ++c) {
+                        float s = 0.f;
+                        for (int d = 0; d < PQ_DIM; ++d) s += ctr[c*PQ_DIM+d]*ctr[c*PQ_DIM+d];
+                        ctr_norms[static_cast<size_t>(c)] = s;
+                    }
+                    bool changed = (iter == 0);
+                    for (int64_t start = 0; start < N; start += chunk) {
+                        const int64_t Bs = std::min(chunk, N - start);
+                        if (static_cast<int64_t>(sub_cross.size()) < Bs * PQ_K)
+                            sub_cross.resize(static_cast<size_t>(Bs * PQ_K));
+                        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                                    (int)Bs, (int)PQ_K, (int)PQ_DIM,
+                                    1.0f, sub_vecs.data() + start*PQ_DIM, (int)PQ_DIM,
+                                    ctr, (int)PQ_DIM,
+                                    0.0f, sub_cross.data(), (int)PQ_K);
+                        for (int64_t b = 0; b < Bs; ++b) {
+                            const int64_t vi = start + b;
+                            float vi_norm = 0.f;
+                            for (int d = 0; d < PQ_DIM; ++d) {
+                                float v = sub_vecs[vi*PQ_DIM+d]; vi_norm += v*v;
+                            }
+                            float best_d = std::numeric_limits<float>::infinity();
+                            int32_t best_c = 0;
+                            for (int c = 0; c < PQ_K; ++c) {
+                                float dd = vi_norm - 2.f*sub_cross[b*PQ_K+c] + ctr_norms[c];
+                                if (dd < best_d) { best_d = dd; best_c = c; }
+                            }
+                            if (sub_assign[vi] != best_c) { changed = true; sub_assign[vi] = best_c; }
+                        }
+                    }
+                    if (!changed) break;
+                    // M-step
+                    std::fill(ctr, ctr + PQ_K * PQ_DIM, 0.f);
+                    std::fill(counts.begin(), counts.end(), 0LL);
+                    for (int64_t i = 0; i < N; ++i) {
+                        int c = sub_assign[i];
+                        counts[static_cast<size_t>(c)]++;
+                        cblas_saxpy((int)PQ_DIM, 1.0f,
+                                    sub_vecs.data() + i*PQ_DIM, 1,
+                                    ctr + c*PQ_DIM, 1);
+                    }
+                    for (int c = 0; c < PQ_K; ++c)
+                        if (counts[static_cast<size_t>(c)] > 0)
+                            cblas_sscal((int)PQ_DIM, 1.0f/counts[static_cast<size_t>(c)],
+                                        ctr + c*PQ_DIM, 1);
+                }
+
+                // Encode: assign each vector to nearest center
+                for (int64_t i = 0; i < N; ++i) {
+                    float best_d = std::numeric_limits<float>::infinity();
+                    uint8_t best_c = 0;
+                    const float* sv = sub_vecs.data() + i*PQ_DIM;
+                    for (int c = 0; c < PQ_K; ++c) {
+                        float dd = 0.f;
+                        const float* ct = ctr + c*PQ_DIM;
+                        for (int d = 0; d < PQ_DIM; ++d) { float dif = sv[d]-ct[d]; dd += dif*dif; }
+                        if (dd < best_d) { best_d = dd; best_c = (uint8_t)c; }
+                    }
+                    pq_codes[i * PQ_M + m] = best_c;
+                }
+            }
+        }
+
+        // ── Precompute symmetric PQ LUT: lut[m×K×K + a×K + b] = dist(ctr[m][a], ctr[m][b])
+        // Size: PQ_M × 256 × 256 × 4 bytes = 8 × 256KB = 2MB → fits in L3 cache.
+        std::vector<float> pq_lut(static_cast<size_t>(PQ_M * PQ_K * PQ_K));
+        for (int64_t m = 0; m < PQ_M; ++m) {
+            const float* ctr_m = pq_centers.data() + m * PQ_K * PQ_DIM;
+            for (int a = 0; a < PQ_K; ++a) {
+                for (int b = a; b < PQ_K; ++b) {
+                    float d2 = 0.f;
+                    const float* ca = ctr_m + a*PQ_DIM, *cb = ctr_m + b*PQ_DIM;
+                    for (int d = 0; d < PQ_DIM; ++d) { float dif = ca[d]-cb[d]; d2 += dif*dif; }
+                    pq_lut[m*PQ_K*PQ_K + a*PQ_K + b] = d2;
+                    pq_lut[m*PQ_K*PQ_K + b*PQ_K + a] = d2;
+                }
+            }
+        }
+
         // ── Build cluster membership lists ─────────────────────────────
         std::vector<std::vector<uint32_t>> clusters(static_cast<size_t>(K));
         for (int64_t i = 0; i < N; ++i)
@@ -501,61 +621,54 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
             const int64_t M = static_cast<int64_t>(probe.size());
             if (M <= 1) continue;
 
-            // Gather probe vectors (once per cluster)
-            std::vector<float> probe_vecs(static_cast<size_t>(M * D));
-            std::vector<float> probe_norms(static_cast<size_t>(M));
-            for (int64_t m = 0; m < M; ++m) {
-                uint32_t pv = probe[static_cast<size_t>(m)];
-                std::copy_n(dataset + pv*D, static_cast<size_t>(D),
-                            probe_vecs.data() + m*D);
-                probe_norms[static_cast<size_t>(m)] = norms[static_cast<size_t>(pv)];
-            }
-
-            // Batch own vectors to bound cross_batch size.
-            // cross[batch×M] = own_batch[batch×D] @ probe_vecs[M×D]^T
-            // Without batching: cross_nm = nk×M can be 114MB for N=1M → OOM/slow.
+            // IVF_PQ: use PQ LUT distances instead of sgemm.
+            // Eliminates probe_vecs gather (16MB random reads → 32KB PQ code reads).
+            // PQ distance is approximate; exact distance computed only for top-G.
             constexpr int64_t MAX_BATCH = 256;
-            const int64_t n_batches = (nk + MAX_BATCH - 1) / MAX_BATCH;
-            std::vector<float> batch_vecs(static_cast<size_t>(
-                std::min(nk, MAX_BATCH) * D));
-            std::vector<float> cross_batch(static_cast<size_t>(
-                std::min(nk, MAX_BATCH) * M));
+            std::vector<float>    pq_cross(static_cast<size_t>(MAX_BATCH * M));
             std::vector<uint32_t> midx(static_cast<size_t>(M));
-            (void)n_batches;
 
             for (int64_t istart = 0; istart < nk; istart += MAX_BATCH) {
                 const int64_t iend = std::min(istart + MAX_BATCH, nk);
                 const int64_t ibsz = iend - istart;
 
-                for (int64_t ii = 0; ii < ibsz; ++ii)
-                    std::copy_n(dataset + own_full[static_cast<size_t>(istart+ii)]*D,
-                                static_cast<size_t>(D),
-                                batch_vecs.data() + ii*D);
+                // PQ distance lookup: O(ibsz × M × PQ_M) byte reads from L3-cached arrays
+                for (int64_t ii = 0; ii < ibsz; ++ii) {
+                    const uint32_t vi = own_full[static_cast<size_t>(istart + ii)];
+                    const uint8_t* vi_c = pq_codes.data() + (size_t)vi * PQ_M;
+                    for (int64_t pm = 0; pm < M; ++pm) {
+                        const uint8_t* pj_c = pq_codes.data() +
+                            (size_t)probe[static_cast<size_t>(pm)] * PQ_M;
+                        float d = 0.f;
+                        for (int64_t sm = 0; sm < PQ_M; ++sm)
+                            d += pq_lut[sm*PQ_K*PQ_K + vi_c[sm]*PQ_K + pj_c[sm]];
+                        pq_cross[ii * M + pm] = d;
+                    }
+                }
 
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                            (int)ibsz, (int)M, (int)D,
-                            1.0f, batch_vecs.data(), (int)D,
-                            probe_vecs.data(), (int)D,
-                            0.0f, cross_batch.data(), (int)M);
-
+                // Sort by PQ-approximate distance, then compute exact distance for top-G
                 const int64_t take = std::min((int64_t)G, M-1);
                 for (int64_t i = istart; i < iend; ++i) {
                     const uint32_t vi = own_full[static_cast<size_t>(i)];
                     const float ni = norms[static_cast<size_t>(vi)];
-                    const float* cr = cross_batch.data() + (i-istart)*M;
+                    const float* cr = pq_cross.data() + (i-istart)*M;
                     std::iota(midx.begin(), midx.end(), 0u);
                     std::partial_sort(midx.begin(), midx.begin()+take, midx.end(),
                         [&](uint32_t a, uint32_t b) {
                             if (probe[a] == vi) return false;
                             if (probe[b] == vi) return true;
-                            return ni-2.f*cr[a]+probe_norms[a] <
-                                   ni-2.f*cr[b]+probe_norms[b];
+                            return cr[a] < cr[b];  // PQ approx dist for ranking
                         });
+                    // Exact distance only for top-G candidates (O(G × D), not O(M × D))
+                    const float* vi_v = dataset + (size_t)vi * D;
                     for (int64_t t = 0; t < take; ++t) {
                         uint32_t nbr = probe[midx[static_cast<size_t>(t)]];
                         if (nbr == vi) continue;
-                        float d = ni - 2.f*cr[midx[static_cast<size_t>(t)]]
-                                  + probe_norms[midx[static_cast<size_t>(t)]];
+                        const float* nbr_v = dataset + (size_t)nbr * D;
+                        float d = 0.f;
+                        for (int64_t dd = 0; dd < D; ++dd) {
+                            float dif = vi_v[dd] - nbr_v[dd]; d += dif*dif;
+                        }
                         insert_neighbor(vi, nbr, d);
                     }
                 }
@@ -703,13 +816,11 @@ uint64_t MetalContext::search_cagra(
     if (!impl_->pso_beam_search)
         throw std::runtime_error("cagra_beam_search kernel not compiled");
 
-    // ── Multi-CTA path for small Q: dispatch N_TEAMS teams per query ──
-    // Each team starts from a different entry point, explores independently.
-    // Host merges N_TEAMS × beam_size candidates → top-K per query.
-    // Q=1→16 teams, Q≤4→8, Q≤16→4, Q>16→1 (fall through to single-CTA).
-    const uint32_t N_TEAMS = (impl_->pso_beam_search_multi_cta && Q <= 16)
-        ? (Q == 1 ? 16u : Q <= 4 ? 8u : 4u)
-        : 1u;
+    // Multi-CTA kernel available (cagra_beam_search_multi_cta) but disabled:
+    // random-access memory-bound workload means teams compete for cache,
+    // causing worse performance than single-CTA (92ms vs 54ms at Q=1).
+    // Kept in codebase for future experimentation on different hardware.
+    const uint32_t N_TEAMS = 1u;
 
     if (N_TEAMS > 1) {
         @autoreleasepool {
