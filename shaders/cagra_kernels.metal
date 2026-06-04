@@ -218,11 +218,12 @@ kernel void cagra_beam_search_multi_cta(
     constant uint&       max_iter    [[ buffer(11) ]],
     constant uint&       N_TEAMS     [[ buffer(12) ]],
     device const uint*   entry_nodes [[ buffer(13) ]],  // Q entry points
-    uint q_id      [[ threadgroup_position_in_grid_x ]],
-    uint team_id   [[ threadgroup_position_in_grid_y ]],
+    uint3 tg_pos   [[ threadgroup_position_in_grid ]],
     uint t_id      [[ thread_position_in_threadgroup ]],
     uint n_threads [[ threads_per_threadgroup ]])
 {
+    const uint q_id   = tg_pos.x;
+    const uint team_id = tg_pos.y;
     const uint vw       = (N + 31u) / 32u;
     const ulong qT      = (ulong)q_id * N_TEAMS + team_id;
     const ulong qD      = (ulong)q_id * D;
