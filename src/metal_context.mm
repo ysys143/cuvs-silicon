@@ -651,30 +651,23 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
                     }
                 }
 
-                // Sort by PQ-approximate distance, then compute exact distance for top-G
+                // Sort by PQ-approximate distance; use PQ dist for insert_neighbor.
+                // nn-descent refinement (Phase 2) corrects distances with exact L2.
                 const int64_t take = std::min((int64_t)G, M-1);
                 for (int64_t i = istart; i < iend; ++i) {
                     const uint32_t vi = own_full[static_cast<size_t>(i)];
-                    const float ni = norms[static_cast<size_t>(vi)];
                     const float* cr = pq_cross.data() + (i-istart)*M;
                     std::iota(midx.begin(), midx.end(), 0u);
                     std::partial_sort(midx.begin(), midx.begin()+take, midx.end(),
                         [&](uint32_t a, uint32_t b) {
                             if (probe[a] == vi) return false;
                             if (probe[b] == vi) return true;
-                            return cr[a] < cr[b];  // PQ approx dist for ranking
+                            return cr[a] < cr[b];
                         });
-                    // Exact distance only for top-G candidates (O(G × D), not O(M × D))
-                    const float* vi_v = dataset + (size_t)vi * D;
                     for (int64_t t = 0; t < take; ++t) {
                         uint32_t nbr = probe[midx[static_cast<size_t>(t)]];
                         if (nbr == vi) continue;
-                        const float* nbr_v = dataset + (size_t)nbr * D;
-                        float d = 0.f;
-                        for (int64_t dd = 0; dd < D; ++dd) {
-                            float dif = vi_v[dd] - nbr_v[dd]; d += dif*dif;
-                        }
-                        insert_neighbor(vi, nbr, d);
+                        insert_neighbor(vi, nbr, cr[midx[static_cast<size_t>(t)]]);
                     }
                 }
             }
