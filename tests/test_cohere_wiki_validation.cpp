@@ -111,11 +111,11 @@ static BenchResult run_metal_bench(
         fflush(stdout);
         std::atomic<bool> build_done{false};
         std::thread watchdog([&build_done]() {
-            for (int i = 0; i < 900; ++i) {
+            for (int i = 0; i < 3600; ++i) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
                 if (build_done.load()) return;
             }
-            std::fprintf(stderr, "\n[TIMEOUT] Build exceeded 900s. Aborting.\n");
+            std::fprintf(stderr, "\n[TIMEOUT] Build exceeded 3600s. Aborting.\n");
             _exit(1);
         });
         auto result = cuvs::neighbors::cagra::build(

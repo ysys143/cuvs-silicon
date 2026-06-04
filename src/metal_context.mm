@@ -348,6 +348,12 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
 
     } else {
         // IVF K-means seeding for large N
+        const auto t_ivf_start = std::chrono::steady_clock::now();
+        auto elapsed_s = [&]() -> double {
+            return std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_ivf_start).count();
+        };
+
         const int64_t K = std::min<int64_t>(
             std::max<int64_t>(static_cast<int64_t>(std::sqrt(static_cast<double>(N))), G+1),
             2000LL);
@@ -426,7 +432,9 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
             }
         }
 
-        fprintf(stderr, "\n  [build] IVF seeding K=%lld  0%%", (long long)K);
+        fprintf(stderr, "\n  [build] K-means done (%.1fs)\n", elapsed_s());
+        fflush(stderr);
+        fprintf(stderr, "  [build] PQ training...");
         fflush(stderr);
 
         // ── IVF_PQ: Product Quantization encoding (replaces probe_vecs gather) ──
@@ -553,6 +561,10 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
                 }
             }
         }
+
+        fprintf(stderr, " done (%.1fs)\n", elapsed_s()); fflush(stderr);
+        fprintf(stderr, "  [build] IVF seeding K=%lld  0%%", (long long)K);
+        fflush(stderr);
 
         // ── Build cluster membership lists ─────────────────────────────
         std::vector<std::vector<uint32_t>> clusters(static_cast<size_t>(K));
@@ -698,8 +710,8 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
                 }
             }
         }
+        fprintf(stderr, "\r  [build] GPU seeding done (%.1fs)\n", elapsed_s()); fflush(stderr);
     } // end IVF seeding
-    fprintf(stderr, "\r  [build] IVF seeding  100%%\n"); fflush(stderr);
 
     // ── Phase 1b: Random bucketing pass (GPU-accelerated) ─────────────────
     // IVF seeding lacks cross-cluster edges. One random bucketing pass adds
