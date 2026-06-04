@@ -28,6 +28,7 @@ struct MetalContext::Impl {
     id<MTLComputePipelineState> pso_beam_search_multi_cta = nil;
     id<MTLComputePipelineState> pso_nn_descent            = nil;
     id<MTLComputePipelineState> pso_random_bucketing      = nil;
+    id<MTLComputePipelineState> pso_pq_cluster_seeding    = nil;
     id<MTLComputePipelineState> pso_brute_force_topk      = nil;
     id<MTLComputePipelineState> pso_l2_topk_from_cross    = nil;
     bool                        available = false;
@@ -79,6 +80,7 @@ MetalContext::MetalContext() : impl_(new Impl) {
         impl_->pso_beam_search_multi_cta = make_pso(@"cagra_beam_search_multi_cta");
         impl_->pso_nn_descent            = make_pso(@"nn_descent");
         impl_->pso_random_bucketing      = make_pso(@"random_bucketing");
+        impl_->pso_pq_cluster_seeding    = make_pso(@"pq_cluster_seeding");
         impl_->pso_brute_force_topk      = make_pso(@"brute_force_topk");
         impl_->pso_l2_topk_from_cross    = make_pso(@"l2_topk_from_cross");
 
@@ -596,79 +598,103 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
         // prevents the rare oversized cluster from causing OOM.
         const int64_t max_own = (N / K) * 4 + 64;
 
-        for (int64_t k = 0; k < K; ++k) {
-            if (k % (K / 10 + 1) == 0) {
-                fprintf(stderr, "\r  [build] IVF seeding  %3lld%%",
-                        (long long)(k * 100 / K));
-                fflush(stderr);
-            }
-            const auto& own_full = clusters[static_cast<size_t>(k)];
-            if (own_full.empty()) continue;
+        // ── GPU cluster seeding: flatten all cluster data, single dispatch ──
+        // Each own vector becomes one threadgroup; GPU finds top-G probe neighbors
+        // using PQ LUT and writes directly to graph[]. No CPU round-trip needed.
+        {
+            // Flatten: build own_flat, probe_flat, vi_probe_off, vi_probe_sz
+            std::vector<uint32_t> own_flat, probe_flat, vi_probe_off, vi_probe_sz;
+            own_flat.reserve(static_cast<size_t>(N));
+            probe_flat.reserve(static_cast<size_t>(N * 4));
 
-            // Sub-sample own if oversized
-            const int64_t nk = std::min(static_cast<int64_t>(own_full.size()), max_own);
-
-            // Build probe set: own (capped) + near clusters
-            std::vector<uint32_t> probe;
-            probe.reserve(static_cast<size_t>(nk +
-                static_cast<int64_t>(n_probe) * (N / K + 1)));
-            for (int64_t i = 0; i < nk; ++i)
-                probe.push_back(own_full[static_cast<size_t>(i)]);
-            for (auto nc : near_clusters[static_cast<size_t>(k)])
-                for (auto v : clusters[static_cast<size_t>(nc)])
-                    probe.push_back(v);
-
-            // Cap probe to prevent sgemm blowup on unbalanced near clusters.
-            constexpr int64_t MAX_PROBE = 8192;
-            if (static_cast<int64_t>(probe.size()) > MAX_PROBE)
-                probe.resize(static_cast<size_t>(MAX_PROBE));
-
-            const int64_t M = static_cast<int64_t>(probe.size());
-            if (M <= 1) continue;
-
-            // IVF_PQ: use PQ LUT distances instead of sgemm.
-            // Eliminates probe_vecs gather (16MB random reads → 32KB PQ code reads).
-            // PQ distance is approximate; exact distance computed only for top-G.
-            constexpr int64_t MAX_BATCH = 256;
-            std::vector<float>    pq_cross(static_cast<size_t>(MAX_BATCH * M));
-            std::vector<uint32_t> midx(static_cast<size_t>(M));
-
-            for (int64_t istart = 0; istart < nk; istart += MAX_BATCH) {
-                const int64_t iend = std::min(istart + MAX_BATCH, nk);
-                const int64_t ibsz = iend - istart;
-
-                // PQ distance lookup: O(ibsz × M × PQ_M) byte reads from L3-cached arrays
-                for (int64_t ii = 0; ii < ibsz; ++ii) {
-                    const uint32_t vi = own_full[static_cast<size_t>(istart + ii)];
-                    const uint8_t* vi_c = pq_codes.data() + (size_t)vi * PQ_M;
-                    for (int64_t pm = 0; pm < M; ++pm) {
-                        const uint8_t* pj_c = pq_codes.data() +
-                            (size_t)probe[static_cast<size_t>(pm)] * PQ_M;
-                        float d = 0.f;
-                        for (int64_t sm = 0; sm < PQ_M; ++sm)
-                            d += pq_lut[sm*PQ_K*PQ_K + vi_c[sm]*PQ_K + pj_c[sm]];
-                        pq_cross[ii * M + pm] = d;
-                    }
+            for (int64_t k = 0; k < K; ++k) {
+                if (k % (K / 10 + 1) == 0) {
+                    fprintf(stderr, "\r  [build] IVF seeding  %3lld%%",
+                            (long long)(k * 100 / K));
+                    fflush(stderr);
                 }
+                const auto& own_full = clusters[static_cast<size_t>(k)];
+                if (own_full.empty()) continue;
 
-                // Sort by PQ-approximate distance; use PQ dist for insert_neighbor.
-                // nn-descent refinement (Phase 2) corrects distances with exact L2.
-                const int64_t take = std::min((int64_t)G, M-1);
-                for (int64_t i = istart; i < iend; ++i) {
-                    const uint32_t vi = own_full[static_cast<size_t>(i)];
-                    const float* cr = pq_cross.data() + (i-istart)*M;
-                    std::iota(midx.begin(), midx.end(), 0u);
-                    std::partial_sort(midx.begin(), midx.begin()+take, midx.end(),
-                        [&](uint32_t a, uint32_t b) {
-                            if (probe[a] == vi) return false;
-                            if (probe[b] == vi) return true;
-                            return cr[a] < cr[b];
-                        });
-                    for (int64_t t = 0; t < take; ++t) {
-                        uint32_t nbr = probe[midx[static_cast<size_t>(t)]];
-                        if (nbr == vi) continue;
-                        insert_neighbor(vi, nbr, cr[midx[static_cast<size_t>(t)]]);
-                    }
+                const int64_t nk = std::min(static_cast<int64_t>(own_full.size()), max_own);
+
+                // Build probe set for this cluster
+                std::vector<uint32_t> probe;
+                probe.reserve(static_cast<size_t>(nk +
+                    static_cast<int64_t>(n_probe) * (N / K + 1)));
+                for (int64_t i = 0; i < nk; ++i)
+                    probe.push_back(own_full[static_cast<size_t>(i)]);
+                for (auto nc : near_clusters[static_cast<size_t>(k)])
+                    for (auto v : clusters[static_cast<size_t>(nc)])
+                        probe.push_back(v);
+                constexpr int64_t MAX_PROBE = 8192;
+                if (static_cast<int64_t>(probe.size()) > MAX_PROBE)
+                    probe.resize(static_cast<size_t>(MAX_PROBE));
+                if (probe.size() <= 1) continue;
+
+                const uint32_t probe_start = static_cast<uint32_t>(probe_flat.size());
+                const uint32_t probe_size  = static_cast<uint32_t>(probe.size());
+                probe_flat.insert(probe_flat.end(), probe.begin(), probe.end());
+
+                for (int64_t i = 0; i < nk; ++i) {
+                    own_flat.push_back(own_full[static_cast<size_t>(i)]);
+                    vi_probe_off.push_back(probe_start);
+                    vi_probe_sz.push_back(probe_size);
+                }
+            }
+
+            const NSUInteger total_nk = own_flat.size();
+            if (total_nk > 0 && impl_->pso_pq_cluster_seeding) {
+                @autoreleasepool {
+                    // Upload PQ data (reused across future calls if N doesn't change)
+                    auto buf_codes = make_shared_buf(impl_->device, pq_codes.data(),
+                                         (NSUInteger)(pq_codes.size() * sizeof(uint8_t)));
+                    auto buf_lut   = make_shared_buf(impl_->device, pq_lut.data(),
+                                         (NSUInteger)(pq_lut.size() * sizeof(float)));
+                    auto buf_own   = make_shared_buf(impl_->device, own_flat.data(),
+                                         (NSUInteger)(own_flat.size() * sizeof(uint32_t)));
+                    auto buf_probe = make_shared_buf(impl_->device, probe_flat.data(),
+                                         (NSUInteger)(probe_flat.size() * sizeof(uint32_t)));
+                    auto buf_vpo   = make_shared_buf(impl_->device, vi_probe_off.data(),
+                                         (NSUInteger)(vi_probe_off.size() * sizeof(uint32_t)));
+                    auto buf_vps   = make_shared_buf(impl_->device, vi_probe_sz.data(),
+                                         (NSUInteger)(vi_probe_sz.size() * sizeof(uint32_t)));
+
+                    // graph + graph_dist are the mutable target
+                    auto buf_graph = [impl_->device
+                        newBufferWithBytes:graph.data()
+                        length:(NSUInteger)(N * G * sizeof(uint32_t))
+                        options:MTLResourceStorageModeShared];
+                    auto buf_gdist = [impl_->device
+                        newBufferWithBytes:graph_dist.data()
+                        length:(NSUInteger)(N * G * sizeof(float))
+                        options:MTLResourceStorageModeShared];
+
+                    uint32_t uG = G, uPQ = (uint32_t)PQ_M;
+                    auto cmd = [impl_->queue commandBuffer];
+                    auto enc = [cmd computeCommandEncoder];
+                    [enc setComputePipelineState:impl_->pso_pq_cluster_seeding];
+                    [enc setBuffer:buf_codes  offset:0 atIndex:0];
+                    [enc setBuffer:buf_lut    offset:0 atIndex:1];
+                    [enc setBuffer:buf_own    offset:0 atIndex:2];
+                    [enc setBuffer:buf_probe  offset:0 atIndex:3];
+                    [enc setBuffer:buf_vpo    offset:0 atIndex:4];
+                    [enc setBuffer:buf_vps    offset:0 atIndex:5];
+                    [enc setBuffer:buf_graph  offset:0 atIndex:6];
+                    [enc setBuffer:buf_gdist  offset:0 atIndex:7];
+                    [enc setBytes:&uG  length:4 atIndex:8];
+                    [enc setBytes:&uPQ length:4 atIndex:9];
+                    [enc dispatchThreadgroups:MTLSizeMake(total_nk, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                    [enc endEncoding];
+                    [cmd commit];
+                    [cmd waitUntilCompleted];
+
+                    // Read back updated graph
+                    std::copy_n((const uint32_t*)buf_graph.contents,
+                                static_cast<size_t>(N * G), graph.data());
+                    std::copy_n((const float*)buf_gdist.contents,
+                                static_cast<size_t>(N * G), graph_dist.data());
                 }
             }
         }

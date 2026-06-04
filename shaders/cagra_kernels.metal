@@ -458,6 +458,76 @@ kernel void random_bucketing(
     }
 }
 
+// PQ cluster seeding: one threadgroup per own vector across all clusters.
+// Computes approximate PQ distances to M probe vectors, finds top-G,
+// and directly writes to graph[] / graph_dist[] — no CPU round-trip.
+// Grid: (total_nk, 1, 1), threads: (N_THREADS_SEED, 1, 1).
+#define SEED_MAX_G 64
+#define SEED_N_THREADS 32
+kernel void pq_cluster_seeding(
+    device const uint8_t*  pq_codes        [[ buffer(0) ]],  // N × PQ_M
+    device const float*    pq_lut          [[ buffer(1) ]],  // PQ_M × 256 × 256
+    device const uint32_t* own_flat        [[ buffer(2) ]],  // total_nk own indices
+    device const uint32_t* probe_flat      [[ buffer(3) ]],  // total probe indices
+    device const uint32_t* vi_probe_off    [[ buffer(4) ]],  // total_nk → offset into probe_flat
+    device const uint32_t* vi_probe_sz     [[ buffer(5) ]],  // total_nk → probe set size
+    device uint32_t*       graph           [[ buffer(6) ]],  // N × G (mutable)
+    device float*          graph_dist      [[ buffer(7) ]],  // N × G (mutable)
+    constant uint&         G               [[ buffer(8) ]],
+    constant uint&         PQ_M            [[ buffer(9) ]],
+    uint vi_global [[ threadgroup_position_in_grid ]],
+    uint t_id      [[ thread_position_in_threadgroup ]],
+    uint n_threads [[ threads_per_threadgroup ]])
+{
+    const uint vi       = own_flat[vi_global];
+    const uint probe_off = vi_probe_off[vi_global];
+    const uint probe_sz  = vi_probe_sz[vi_global];
+    if (probe_sz == 0) return;
+
+    const device uint8_t* vi_c = pq_codes + (ulong)vi * PQ_M;
+    const uint take = min(G, (uint)SEED_MAX_G);
+
+    // Thread-local top-G max-heap
+    float heap_d[SEED_MAX_G];
+    uint  heap_n[SEED_MAX_G];
+    for (uint g = 0; g < take; ++g) { heap_d[g] = INFINITY; heap_n[g] = 0xFFFFFFFFu; }
+
+    // Strided sweep over probe vectors
+    for (uint pi = t_id; pi < probe_sz; pi += n_threads) {
+        const uint pj = probe_flat[probe_off + pi];
+        if (pj == vi) continue;
+        const device uint8_t* pj_c = pq_codes + (ulong)pj * PQ_M;
+        float dist = 0.f;
+        for (uint m = 0; m < PQ_M; ++m)
+            dist += pq_lut[m * 256u * 256u + vi_c[m] * 256u + pj_c[m]];
+        float worst = heap_d[0]; uint wi = 0u;
+        for (uint g = 1u; g < take; ++g) { if (heap_d[g] > worst) { worst = heap_d[g]; wi = g; } }
+        if (dist < worst) { heap_d[wi] = dist; heap_n[wi] = pj; }
+    }
+
+    // Merge threads via threadgroup shared memory
+    threadgroup float tg_d[SEED_N_THREADS * SEED_MAX_G];  // 32×64×4 = 8KB
+    threadgroup uint  tg_n[SEED_N_THREADS * SEED_MAX_G];  // total 16KB < 32KB limit
+    const uint off = t_id * take;
+    for (uint g = 0; g < take; ++g) { tg_d[off+g] = heap_d[g]; tg_n[off+g] = heap_n[g]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (t_id == 0) {
+        // Collect all candidates and insert into graph
+        const ulong row = (ulong)vi * G;
+        for (uint i = 0; i < n_threads * take; ++i) {
+            uint  nbr  = tg_n[i];
+            float d    = tg_d[i];
+            if (nbr == 0xFFFFFFFFu) continue;
+            float worst = graph_dist[row]; uint wi = 0u;
+            for (uint g = 1u; g < G; ++g) {
+                if (graph_dist[row+g] > worst) { worst = graph_dist[row+g]; wi = g; }
+            }
+            if (d < worst) { graph[row+wi] = nbr; graph_dist[row+wi] = d; }
+        }
+    }
+}
+
 // Brute-force top-K search: one threadgroup per query.
 // Threads sweep all N database vectors in parallel, each maintaining a
 // thread-local top-K heap. Merge via threadgroup shared memory.
