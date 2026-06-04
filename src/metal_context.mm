@@ -446,7 +446,7 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
         constexpr int64_t PQ_M   = 8;        // subspaces — LUT=2MB fits in L2 cache
         constexpr int64_t PQ_DIM = 128;      // dims per subspace (D/PQ_M = 1024/8)
         constexpr int     PQ_K   = 256;      // centers per subspace (8-bit codes)
-        constexpr int     pq_iters = 5;      // 10→5: fewer iters + convergence check
+        constexpr int     pq_iters = 10;     // K-means iterations for PQ subspaces
 
         std::vector<float>   pq_centers(static_cast<size_t>(PQ_M * PQ_K * PQ_DIM));
         std::vector<uint8_t> pq_codes(static_cast<size_t>(N * PQ_M));

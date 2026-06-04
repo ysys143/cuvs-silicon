@@ -56,7 +56,7 @@ index<float, std::uint32_t> build<float, std::int64_t>(
               static_cast<int64_t>(std::sqrt(static_cast<double>(N)) * 2)));
       // IVF K-means seeding provides high-quality initial graph for large N,
       // so fewer nn-descent iterations are needed to reach good recall.
-      const uint32_t nd_iters = (N <= 50000) ? 20 : (N <= 200000) ? 2 : 0;
+      const uint32_t nd_iters = (N <= 50000) ? 20 : (N <= 200000) ? 5 : 0;
       auto knn = ctx.build_knn_graph(data, N, D, G, nd_iters, bucket_size);
       idx.set_knn_graph(std::move(knn), G);
 
