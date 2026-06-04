@@ -357,9 +357,9 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
         const int64_t K = std::min<int64_t>(
             std::max<int64_t>(static_cast<int64_t>(std::sqrt(static_cast<double>(N))), G+1),
             2000LL);
-        constexpr int km_iters = 20;
+        constexpr int km_iters = 10;  // 20→10: L3-fit chunk compensates quality
         constexpr int n_probe  = 3;   // probe own + 3 nearest clusters
-        constexpr int64_t chunk = 4096; // chunk size for E-step to limit memory
+        constexpr int64_t chunk = 2048; // A(8MB)+C(8MB)+B(4MB)=20MB < L3(32MB)
 
         // ── K-means initialization: evenly-spaced strides ────────────────
         // Random LCG can repeat indices (39% collision chance for K=316, N=100K)
@@ -441,10 +441,10 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
         // Reduces random-access gather from 16MB per cluster → 32KB.
         // PQ_M subspaces each with 256 centers, stored as uint8 codes.
         // LUT (2MB) fits in L3 cache; pq_codes (8MB) mostly in L3 too.
-        constexpr int64_t PQ_M   = 4;        // subspaces — LUT=1MB fits in L2 cache
-        constexpr int64_t PQ_DIM = 256;      // dims per subspace (D/PQ_M = 1024/4)
+        constexpr int64_t PQ_M   = 8;        // subspaces — LUT=2MB fits in L2 cache
+        constexpr int64_t PQ_DIM = 128;      // dims per subspace (D/PQ_M = 1024/8)
         constexpr int     PQ_K   = 256;      // centers per subspace (8-bit codes)
-        constexpr int     pq_iters = 10;     // K-means iterations for PQ training
+        constexpr int     pq_iters = 5;      // 10→5: fewer iters + convergence check
 
         std::vector<float>   pq_centers(static_cast<size_t>(PQ_M * PQ_K * PQ_DIM));
         std::vector<uint8_t> pq_codes(static_cast<size_t>(N * PQ_M));
