@@ -357,7 +357,7 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
         const int64_t K = std::min<int64_t>(
             std::max<int64_t>(static_cast<int64_t>(std::sqrt(static_cast<double>(N))), G+1),
             2000LL);
-        constexpr int km_iters = 10;  // 20→10: L3-fit chunk compensates quality
+        constexpr int km_iters = 20;  // needs full convergence for quality seeding
         constexpr int n_probe  = 3;   // probe own + 3 nearest clusters
         constexpr int64_t chunk = 2048; // A(8MB)+C(8MB)+B(4MB)=20MB < L3(32MB)
 
