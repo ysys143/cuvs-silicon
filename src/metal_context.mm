@@ -28,7 +28,8 @@ struct MetalContext::Impl {
     id<MTLComputePipelineState> pso_beam_search_multi_cta = nil;
     id<MTLComputePipelineState> pso_nn_descent            = nil;
     id<MTLComputePipelineState> pso_random_bucketing      = nil;
-    id<MTLComputePipelineState> pso_pq_cluster_seeding    = nil;
+    id<MTLComputePipelineState> pso_pq_cluster_seeding      = nil;
+    id<MTLComputePipelineState> pso_recompute_graph_dists   = nil;
     id<MTLComputePipelineState> pso_brute_force_topk      = nil;
     id<MTLComputePipelineState> pso_l2_topk_from_cross    = nil;
     bool                        available = false;
@@ -81,6 +82,7 @@ MetalContext::MetalContext() : impl_(new Impl) {
         impl_->pso_nn_descent            = make_pso(@"nn_descent");
         impl_->pso_random_bucketing      = make_pso(@"random_bucketing");
         impl_->pso_pq_cluster_seeding    = make_pso(@"pq_cluster_seeding");
+        impl_->pso_recompute_graph_dists = make_pso(@"recompute_graph_distances");
         impl_->pso_brute_force_topk      = make_pso(@"brute_force_topk");
         impl_->pso_l2_topk_from_cross    = make_pso(@"l2_topk_from_cross");
 
@@ -706,11 +708,31 @@ std::vector<uint32_t> MetalContext::build_knn_graph(
                     std::copy_n((const uint32_t*)buf_graph.contents,
                                 static_cast<size_t>(N * G), graph.data());
 
-                    // PQ distances are on a different scale than exact L2 (PQ ≈ 0.01,
-                    // L2 ≈ 1.0+), so reset graph_dist to INFINITY for valid edges.
-                    // nn-descent will compute and store exact L2 on first iteration.
-                    std::fill(graph_dist.begin(), graph_dist.end(),
-                              std::numeric_limits<float>::infinity());
+                    // Recompute exact L2 distances on GPU — PQ approximate distances
+                    // in graph_dist cause nn-descent to skip valid improvements due
+                    // to scale mismatch (PQ ≈ 0.01-0.1, L2 ≈ 0.5-2.0).
+                    if (impl_->pso_recompute_graph_dists) {
+                        auto buf_graph_rdist = make_shared_buf(impl_->device,
+                            graph.data(), (NSUInteger)(N * G * sizeof(uint32_t)));
+                        auto buf_gdist_out = make_empty_buf(impl_->device,
+                            (NSUInteger)(N * G * sizeof(float)));
+                        uint32_t uD2 = (uint32_t)D, uG2 = G;
+                        auto cmd2 = [impl_->queue commandBuffer];
+                        auto enc2 = [cmd2 computeCommandEncoder];
+                        [enc2 setComputePipelineState:impl_->pso_recompute_graph_dists];
+                        [enc2 setBuffer:buf_dataset     offset:0 atIndex:0];
+                        [enc2 setBuffer:buf_graph_rdist offset:0 atIndex:1];
+                        [enc2 setBuffer:buf_gdist_out   offset:0 atIndex:2];
+                        [enc2 setBytes:&uD2 length:4 atIndex:3];
+                        [enc2 setBytes:&uG2 length:4 atIndex:4];
+                        [enc2 dispatchThreadgroups:MTLSizeMake((NSUInteger)N, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(G, 1, 1)];
+                        [enc2 endEncoding];
+                        [cmd2 commit];
+                        [cmd2 waitUntilCompleted];
+                        std::copy_n((const float*)buf_gdist_out.contents,
+                                    static_cast<size_t>(N * G), graph_dist.data());
+                    }
                 }
             }
         }

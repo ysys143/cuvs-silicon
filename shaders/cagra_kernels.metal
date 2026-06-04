@@ -652,6 +652,34 @@ kernel void l2_topk_from_cross(
     }
 }
 
+// Recompute exact L2 distances for all graph edges after PQ seeding.
+// Replaces approximate PQ distances with true L2 so nn-descent compares correctly.
+// Grid: (N, 1, 1), threads: (G, 1, 1) — one threadgroup per node, one thread per edge.
+kernel void recompute_graph_distances(
+    device const float*    dataset    [[ buffer(0) ]],  // N×D
+    device const uint*     graph      [[ buffer(1) ]],  // N×G
+    device float*          graph_dist [[ buffer(2) ]],  // N×G (output)
+    constant uint&         D          [[ buffer(3) ]],
+    constant uint&         G          [[ buffer(4) ]],
+    uint node_id [[ threadgroup_position_in_grid ]],
+    uint g_id    [[ thread_position_in_threadgroup ]])
+{
+    const uint nbr = graph[(ulong)node_id * G + g_id];
+    if (nbr == 0xFFFFFFFFu) {
+        graph_dist[(ulong)node_id * G + g_id] = INFINITY;
+        return;
+    }
+    const uint D4 = D >> 2u;
+    const device float4* qv = (const device float4*)(dataset + (ulong)node_id * D);
+    const device float4* nv = (const device float4*)(dataset + (ulong)nbr       * D);
+    float dist = 0.f;
+    for (uint d = 0; d < D4; ++d) {
+        float4 delta = qv[d] - nv[d];
+        dist += dot(delta, delta);
+    }
+    graph_dist[(ulong)node_id * G + g_id] = dist;
+}
+
 // P4: brute-force L2 distance — one thread per base vector.
 // Each thread computes squared Euclidean distance from base vector gid to the query.
 // dataset: N x D row-major float32
