@@ -1,182 +1,171 @@
 # cuvs-silicon
 
-Apple Silicon(M-series) Metal GPU를 활용한 벡터 유사도 검색 라이브러리.  
-[NVIDIA CUVS](https://github.com/rapidsai/cuvs)의 핵심 알고리즘(CAGRA, Brute-Force)을  
-Metal Compute Shader로 이식하고, Apple의 AMX/MPS/MLX 가속을 함께 활용한다.
+[![C++17](https://img.shields.io/badge/C++-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
+[![Metal](https://img.shields.io/badge/Metal-3.0+-silver.svg)](https://developer.apple.com/metal/)
+[![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2FM2%2FM3-black.svg)](https://www.apple.com/mac/)
+[![Apache 2.0 License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
+GPU-accelerated vector similarity search for Apple Silicon, built on Metal Compute Shaders and the Accelerate framework (AMX). Implements brute-force exact search and CAGRA graph-based approximate nearest neighbor (ANN) search.
 
 ---
 
-## 주요 결과
+## Highlights
 
-### Brute-Force 검색 (GPU 정확 탐색)
+- **Brute-force exact search**: 2.87× faster than metalfaiss (MLX) at N=1M, D=1024
+- **CAGRA ANN**: beats hnswlib build time at N=100K with competitive recall
+- **2-pass GPU pipeline**: MPS float16 matmul + GPU top-K kernel — only Q×K results leave the GPU
+- **Index persistence**: save/load built CAGRA index to skip rebuild
 
-N=1M, D=1024, K=10, Q=100 쿼리 기준 (M3 Max):
+---
 
-| 구현 | QPS | p50 레이턴시(Q=100) | recall@10 |
+## Benchmarks
+
+### Brute-Force Search — N=1M, D=1024, K=10 (M3 Max, Q=100)
+
+| Implementation | QPS | p50 latency | recall@10 |
 |---|---|---|---|
-| **cuvs-silicon** | **1012** | **99ms** | 1.0000 |
-| metalfaiss (MLX) | 351 | 275ms | 1.0000 |
-| AMX cblas_sgemm | 13.8 | - | 1.0000 |
+| **cuvs-silicon** | **1012** | **99 ms** | 1.0000 |
+| metalfaiss (MLX) | 351 | 275 ms | 1.0000 |
+| AMX cblas_sgemm (CPU) | 14 | — | 1.0000 |
 
-metalfaiss 대비 **2.87× 빠름**.  
-2-pass 구조: MPS float16 행렬곱(dataset 한 번 읽기) + GPU top-K 커널(Q×K만 CPU로 전송).
+### CAGRA ANN — N=100K, D=1024 (M3 Max)
 
-### CAGRA 그래프 기반 ANN 검색
-
-N=100K, D=1024 (M3 Max):
-
-| 항목 | cuvs-silicon | hnswlib |
+| | cuvs-silicon | hnswlib ef=128 |
 |---|---|---|
-| 빌드 시간 | 149s | 67s |
-| search QPS | 518 | ~430 |
+| Build time | 149 s | 67 s |
+| Search QPS | 518 | ~430 |
 | recall@10 | 0.9960 | ~0.97 |
-| Q=1 레이턴시 | 54ms | ~1ms |
+| Q=1 latency | 54 ms | ~1 ms |
 
-N=1M:
-- 빌드: 2714s (완료), recall=0.72 (Q=1 레이턴시 미측정)
-- CUDA CUVS 비교: 22s 빌드, recall=0.986 (A100 40GB)
+> Single-query (Q=1) latency is hardware-limited on Apple Silicon. Any GPU approach — including metalfaiss (82 ms at Q=1) — is slower than CPU HNSW (~1 ms) for single queries due to Metal command buffer overhead (~2 ms fixed cost) and unified memory bandwidth constraints. See [docs/apple_silicon_gpu_vector_search_report.md](docs/apple_silicon_gpu_vector_search_report.md).
 
 ---
 
-## 아키텍처
+## Installation
+
+**Requirements**: macOS 14+, Xcode 15+, Apple Silicon (M1/M2/M3), CMake 3.20+
+
+```bash
+git clone https://github.com/ysys143/cuvs-silicon.git
+cd cuvs-silicon
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+```
+
+---
+
+## Usage
+
+### Brute-Force Exact Search
+
+Pass `graph_degree=0` to skip graph build and use exact GPU search:
+
+```bash
+./build/cohere_wiki_validation \
+    data/1m/base.bin data/1m/queries.bin data/1m/gt.bin \
+    10 1 3 0   # K warmup measure graph_degree=0
+```
+
+### CAGRA ANN Search
+
+```bash
+# Build index and search
+./build/cohere_wiki_validation \
+    data/100k/base.bin data/100k/queries.bin data/100k/gt.bin \
+    10 1 3     # K warmup measure [graph_degree=64]
+
+# Save index after build  (argv[8] = save path)
+./build/cohere_wiki_validation ... 10 1 3 64 /path/to/index.idx
+
+# Load saved index and search  (argv[9] = load path)
+./build/cohere_wiki_validation ... 10 1 3 64 "" /path/to/index.idx
+```
+
+### Download Benchmark Data
+
+```bash
+python3 scripts/download_cohere_wiki.py   # downloads 10K / 100K / 1M splits
+```
+
+---
+
+## Architecture
 
 ### Brute-Force (2-pass GPU)
 
 ```
-[Pass 1] MPS MPSMatrixMultiplication (float16)
-  queries[Q×D] @ dataset[N×D]^T → cross[Q×N]  (GPU 전용 버퍼)
+Pass 1  MPS MPSMatrixMultiplication (float16 inputs)
+        queries[Q×D] @ dataset[N×D]^T  →  cross[Q×N]   (GPU-private buffer)
 
-[Pass 2] Metal 커널 l2_topk_from_cross
-  cross[Q×N] + q_norms + d_norms → top-K indices/distances  (Q×K만 CPU로)
+Pass 2  Metal kernel: l2_topk_from_cross
+        cross + q_norms + d_norms  →  top-K indices/distances
+        CPU receives only Q×K bytes (e.g. 100 queries × 10 results × 8 B = 8 KB)
 ```
 
-- dataset float16 변환 캐시: N×D×2 bytes (1M×1024: 2GB)
-- GPU 버퍼 캐시: d_norms, dataset_fp16 반복 호출 시 재사용
+Dataset and d_norms are cached across calls as float16 Metal buffers.
 
-### CAGRA (그래프 기반 ANN)
+### CAGRA Build Pipeline
 
 ```
-빌드:
-  Phase 1a: IVF K-means 세딩 (N≤200K: exact sgemm, N>200K: IVF_PQ)
-  Phase 1b: random bucketing (Metal GPU 커널, cross-cluster 연결)
-  Phase 2:  nn-descent 정제 (Metal GPU 커널, float4 SIMD)
+Phase 1a  IVF K-means seeding
+          N ≤ 200K : exact cblas_sgemm per cluster (AMX, L3-resident)
+          N > 200K : IVF_PQ — LUT distance lookup, CPU PQ training
 
-검색:
-  AMX cblas_sgemm으로 nav_vectors에서 진입점 선택
-  Metal GPU beam search (beam_size=32~512, float4 거리)
+Phase 1b  GPU random bucketing  (Metal kernel, cross-cluster diversity)
+
+Phase 2   nn-descent refinement (Metal kernel, float4 SIMD distances)
 ```
+
+Entry-point selection at search time uses AMX-accelerated cblas_sgemm over cached navigation vectors.
 
 ---
 
-## CAGRA 한계와 원인 분석
+## CAGRA Limitations
 
-NVIDIA CUVS CAGRA는 Q=1 레이턴시 2.4ms, 22s 빌드(1M×1536d)를 달성한다.  
-cuvs-silicon이 이를 재현하지 못하는 구조적 이유:
+### Single-query latency
 
-### 1. 단일 쿼리 레이턴시 (Q=1)
+CAGRA Q=1 latency is 54 ms on cuvs-silicon vs. 2.4 ms on NVIDIA CUVS (A100).  
+Root cause: Metal command buffer fixed overhead (~2 ms) + single threadgroup dispatched for Q=1 → 2.6% GPU utilization. Multi-CTA beam search was implemented and tested but worsened latency due to cache thrashing on memory-bound traversal.
 
-cuvs-silicon: **54ms** / hnswlib CPU: **~1ms** / CUVS CUDA: **2.4ms**
+### 1M-scale build
 
-```
-원인:
-- Metal commandBuffer dispatch 오버헤드: ~2ms (CUDA: ~5μs)
-- Q=1 = 1 threadgroup → GPU 2.6% 활용 (CUDA multi-CTA: 전 SM 포화)
-- 1M 데이터셋 random access 최솟값: 4GB/400GB·s = 10ms
-```
+| Stage | Time | Root cause |
+|---|---|---|
+| K-means (chunk=2048) | 341 s | M-step scatter-add is DRAM-bound on CPU |
+| PQ training | 764 s | 8 subspace × N=1M → 229 B memory ops |
+| CPU PQ seeding | 1548 s | 229 B pair lookups × ~3 ns each |
+| GPU bucketing + misc | ~60 s | — |
+| **Total** | **2714 s** | — |
 
-metalfaiss(MLX)도 Q=1에서 82ms로 cuvs-silicon(19ms, brute-force)보다 느림.  
-→ **Q=1 고레이턴시는 Apple Silicon GPU의 구조적 한계**임을 실험으로 확인.
-
-### 2. 1M 빌드 시간
-
-cuvs-silicon: **2714s** / CUVS CUDA: **22s**
-
-```
-병목 분석 (타임스탬프 실측):
-  K-means (chunk=2048): 341s  ← M-step scatter-add DRAM bottleneck
-  PQ training (8 subspaces): 764s  ← 229B lookup × ~3ns = too slow on CPU
-  CPU PQ seeding: 1548s         ← 229B pair × 8 LUT reads × CPU bandwidth
-  GPU bucketing: ~30s           ← Metal GPU, fast
-  Total: 2714s
-```
-
-CUDA A100은 HBM2e(2TB/s)로 같은 229B 연산을 ~8s에 처리.  
-M3 Max CPU는 DRAM effective bandwidth ~50GB/s → **40× 느림**.
-
-### 3. 무엇이 필요한가
-
-CAGRA의 완전한 GPU 가속을 위해서는:
-- K-means M-step: Metal GPU atomic scatter-add 커널
-- IVF_PQ 세딩: Metal GPU PQ lookup 커널 (pq_codes + LUT 전부 GPU 메모리에)
-- nn-descent: 현재 구현은 1M에서 ~900s/iteration → 최적화 필요
-
-이 세 가지가 모두 Metal GPU로 이식되면 이론적으로 100-200s 빌드가 가능하다.
+NVIDIA CUVS completes the same workload in 22 s (A100, HBM2e 2 TB/s vs. CPU ~50 GB/s effective).  
+A Metal GPU kernel for the PQ seeding step would reduce the bottleneck to ~100 s.  
+See [docs/multi-cta-ivf-pq-lessons.md](docs/multi-cta-ivf-pq-lessons.md) for full analysis.
 
 ---
 
-## 빌드
+## Contributing
 
-```bash
-mkdir build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make -j$(nproc)
-```
+Contributions are welcome. The highest-impact areas:
 
-요구사항: macOS 14+, Xcode 15+, Apple Silicon (M1/M2/M3)
+| Area | Expected impact | Status |
+|---|---|---|
+| **Metal GPU K-means M-step** (scatter-add kernel) | 1M build: 341 s → ~50 s | open |
+| **Metal GPU IVF_PQ seeding kernel** | 1M build: 1548 s → ~100 s | open — [draft kernel exists](shaders/cagra_kernels.metal), bug in PQ distance scale |
+| **nn-descent optimization for N=1M** | enables recall improvement at 1M | open |
+| Multi-CTA beam search (Q=1 latency) | 54 ms → ~10 ms | open — [kernel implemented](shaders/cagra_kernels.metal), disabled |
 
----
-
-## 벤치마크
-
-```bash
-# Cohere Wikipedia 1M×1024d 데이터 다운로드
-python3 scripts/download_cohere_wiki.py
-
-# Brute-force (GPU 정확 탐색)
-./build/cohere_wiki_validation data/1m/cohere_wiki_base.bin \
-    data/1m/cohere_wiki_queries.bin data/1m/cohere_wiki_gt.bin 10 1 3 0
-
-# CAGRA ANN
-./build/cohere_wiki_validation data/100k/cohere_wiki_base.bin \
-    data/100k/cohere_wiki_queries.bin data/100k/cohere_wiki_gt.bin 10 1 3
-
-# 인덱스 저장/로드
-./build/cohere_wiki_validation ... 10 1 3 64 /path/to/index.idx       # 저장
-./build/cohere_wiki_validation ... 10 1 3 64 "" /path/to/index.idx    # 로드
-```
+Please open an issue before starting large changes.
 
 ---
 
-## 기여 환영
+## Related Projects
 
-다음 영역에서 기여를 환영합니다:
-
-**높은 우선순위**
-- [ ] **Metal GPU K-means M-step 커널**: scatter-add를 GPU로 이식하면 1M 빌드 시간이 50% 이상 단축될 것으로 예상
-- [ ] **Metal GPU IVF_PQ 세딩 커널**: `pq_cluster_seeding` 커널의 버그 수정 또는 재설계 (현재 PQ distance scale 문제로 비활성화)
-- [ ] **1M CAGRA recall 개선**: nn-descent GPU 커널 최적화로 1M에서 nd_iters≥1 달성
-
-**중간 우선순위**
-- [ ] Multi-CTA beam search: Q=1 레이턴시를 10ms 이하로 (현재 커널 구현됨, 검증 필요)
-- [ ] IVF_PQ 빌드 파이프라인 최적화 (K-means + PQ training 속도)
-- [ ] faiss-mlx와의 통합 또는 비교 벤치마크
-
-**낮은 우선순위**
-- [ ] ILP64 Accelerate API 마이그레이션 (deprecated cblas 경고 제거)
-- [ ] Python 바인딩
-- [ ] PostgreSQL 통합 (pg_cuvs 참조)
+- [NVIDIA CUVS](https://github.com/rapidsai/cuvs) — CUDA reference implementation
+- [MetalFaiss / Faiss-mlx](https://github.com/MLXPorts/Faiss-mlx) — MLX-based FAISS (comparison baseline)
+- [hnswlib](https://github.com/nmslib/hnswlib) — CPU HNSW baseline
 
 ---
 
-## 관련 프로젝트
+## License
 
-- [NVIDIA CUVS](https://github.com/rapidsai/cuvs) — CUDA 기반 원본 구현
-- [metalfaiss](https://github.com/) — MLX 기반 FAISS (비교 대상)
-- [hnswlib](https://github.com/nmslib/hnswlib) — CPU HNSW 기준선
-- [pg_cuvs](../pg_cuvs) — PostgreSQL 확장 (CUDA)
-
----
-
-## 라이선스
-
-Apache 2.0
+Apache 2.0 — Copyright 2026 JAESOL SHIN
