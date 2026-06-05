@@ -28,16 +28,10 @@ GPU-accelerated vector similarity search for Apple Silicon, built on Metal Compu
 | metalfaiss (MLX) | 351 | 275 ms | 1.0000 |
 | AMX cblas_sgemm (CPU) | 14 | — | 1.0000 |
 
-### CAGRA ANN — N=100K, D=1024 (M3 Max)
+### CAGRA ANN — experimental
 
-| | cuvs-silicon | hnswlib ef=128 |
-|---|---|---|
-| Build time | 149 s | 67 s |
-| Search QPS | 518 | ~430 |
-| recall@10 | 0.9960 | ~0.97 |
-| Q=1 latency | 54 ms | ~1 ms |
-
-> Single-query (Q=1) latency is hardware-limited on Apple Silicon. Any GPU approach — including metalfaiss (82 ms at Q=1) — is slower than CPU HNSW (~1 ms) for single queries due to Metal command buffer overhead (~2 ms fixed cost) and unified memory bandwidth constraints. See [docs/apple_silicon_gpu_vector_search_report.md](docs/apple_silicon_gpu_vector_search_report.md).
+CAGRA was implemented and benchmarked but the results were not satisfying.
+See [docs/apple_silicon_gpu_vector_search_report.md](docs/apple_silicon_gpu_vector_search_report.md) for detailed results and analysis.
 
 ---
 
